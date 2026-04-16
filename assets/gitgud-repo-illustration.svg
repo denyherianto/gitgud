@@ -1,79 +1,64 @@
-<svg width="960" height="520" viewBox="0 0 960 520" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
-  <title id="title">gitgud repository illustration</title>
-  <desc id="desc">A stylized repository card with Git nodes, files, and AI-assisted commit motifs.</desc>
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">gitgud mascot icon</title>
+  <desc id="desc">A mascot icon for gitgud with fox-like ears, a cheerful face, and git branch details.</desc>
   <defs>
-    <linearGradient id="bg" x1="80" y1="40" x2="860" y2="480" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#F5F1E8"/>
-      <stop offset="1" stop-color="#E4EEF7"/>
+    <linearGradient id="bg" x1="72" y1="60" x2="440" y2="452" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F8F0DE"/>
+      <stop offset="1" stop-color="#DCEBF8"/>
     </linearGradient>
-    <linearGradient id="panel" x1="204" y1="96" x2="756" y2="424" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#FFFDF8"/>
-      <stop offset="1" stop-color="#F6FAFF"/>
+    <linearGradient id="fur" x1="164" y1="144" x2="362" y2="366" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFB65E"/>
+      <stop offset="1" stop-color="#F06A4C"/>
     </linearGradient>
-    <linearGradient id="folder" x1="266" y1="170" x2="558" y2="338" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#FFC65C"/>
-      <stop offset="1" stop-color="#FF9458"/>
+    <linearGradient id="muzzle" x1="190" y1="236" x2="320" y2="336" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFF7EA"/>
+      <stop offset="1" stop-color="#FFE6C9"/>
     </linearGradient>
-    <linearGradient id="terminal" x1="580" y1="182" x2="714" y2="320" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#1A2430"/>
-      <stop offset="1" stop-color="#0E151D"/>
-    </linearGradient>
-    <filter id="shadow" x="156" y="58" width="648" height="404" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+    <filter id="shadow" x="92" y="98" width="328" height="328" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
       <feFlood flood-opacity="0" result="BackgroundImageFix"/>
       <feColorMatrix in="SourceAlpha" type="matrix" values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 127 0" result="hardAlpha"/>
       <feOffset dy="16"/>
-      <feGaussianBlur stdDeviation="24"/>
-      <feColorMatrix type="matrix" values="0 0 0 0 0.0705882 0 0 0 0 0.121569 0 0 0 0 0.180392 0 0 0 0.16 0"/>
+      <feGaussianBlur stdDeviation="18"/>
+      <feColorMatrix type="matrix" values="0 0 0 0 0.0823529 0 0 0 0 0.137255 0 0 0 0 0.207843 0 0 0 0.2 0"/>
       <feBlend mode="normal" in2="BackgroundImageFix" result="effect1_dropShadow_0_1"/>
       <feBlend mode="normal" in="SourceGraphic" in2="effect1_dropShadow_0_1" result="shape"/>
     </filter>
   </defs>
 
-  <rect width="960" height="520" rx="40" fill="url(#bg)"/>
+  <rect width="512" height="512" rx="120" fill="url(#bg)"/>
 
-  <circle cx="143" cy="128" r="44" fill="#DCE8F7"/>
-  <circle cx="821" cy="110" r="62" fill="#FBE2BF"/>
-  <circle cx="824" cy="396" r="52" fill="#D9EFE5"/>
+  <circle cx="126" cy="120" r="40" fill="#FDE0B6"/>
+  <circle cx="406" cy="130" r="34" fill="#D6E7F6"/>
+  <circle cx="418" cy="394" r="48" fill="#D9F2E7"/>
 
   <g filter="url(#shadow)">
-    <rect x="204" y="96" width="552" height="308" rx="28" fill="url(#panel)"/>
-    <rect x="204" y="96" width="552" height="308" rx="28" stroke="#D7E0EA" stroke-width="2"/>
+    <path d="M186 188L138 128C129.6 117.5 132.9 101.9 145 96.1L195 72.2C208.2 65.9 223.5 72.4 228.5 86.1L248 139L186 188Z" fill="#243244"/>
+    <path d="M326 188L374 128C382.4 117.5 379.1 101.9 367 96.1L317 72.2C303.8 65.9 288.5 72.4 283.5 86.1L264 139L326 188Z" fill="#243244"/>
 
-    <rect x="232" y="122" width="496" height="28" rx="14" fill="#EFF4F8"/>
-    <circle cx="256" cy="136" r="5" fill="#FF8E7C"/>
-    <circle cx="276" cy="136" r="5" fill="#FFC65C"/>
-    <circle cx="296" cy="136" r="5" fill="#6DCAA0"/>
-    <rect x="330" y="129" width="122" height="14" rx="7" fill="#D9E3EE"/>
+    <path d="M191 176L160 136C155.8 130.6 157.5 122.9 163.7 119.9L196.2 104.3C202.8 101.1 210.4 104.4 213 111.4L226 145.7L191 176Z" fill="#FF8A76"/>
+    <path d="M321 176L352 136C356.2 130.6 354.5 122.9 348.3 119.9L315.8 104.3C309.2 101.1 301.6 104.4 299 111.4L286 145.7L321 176Z" fill="#FF8A76"/>
 
-    <path d="M608 216C608 194.909 625.909 177 647 177H682C703.091 177 721 194.909 721 216V288C721 309.091 703.091 327 682 327H647C625.909 327 608 309.091 608 288V216Z" fill="url(#terminal)"/>
-    <path d="M633 215L650 230L633 245" stroke="#9DD6FF" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
-    <rect x="659" y="236" width="31" height="8" rx="4" fill="#78E6A7"/>
-    <rect x="631" y="271" width="68" height="8" rx="4" fill="#405266"/>
-    <rect x="631" y="289" width="44" height="8" rx="4" fill="#405266"/>
+    <circle cx="256" cy="256" r="136" fill="url(#fur)"/>
+    <path d="M194 314C218.5 332.7 289.5 332.7 318 314V248H194V314Z" fill="url(#muzzle)"/>
+    <ellipse cx="210" cy="228" rx="18" ry="24" fill="#1A2430"/>
+    <ellipse cx="302" cy="228" rx="18" ry="24" fill="#1A2430"/>
+    <circle cx="216" cy="220" r="5" fill="#FFFFFF"/>
+    <circle cx="308" cy="220" r="5" fill="#FFFFFF"/>
+    <path d="M256 250L236 286H276L256 250Z" fill="#1A2430"/>
+    <path d="M231 301C244.4 317 267.6 317 281 301" stroke="#1A2430" stroke-width="9" stroke-linecap="round"/>
+    <path d="M208 186C218.5 177.3 233.8 173 246 174" stroke="#243244" stroke-width="8" stroke-linecap="round"/>
+    <path d="M304 186C293.5 177.3 278.2 173 266 174" stroke="#243244" stroke-width="8" stroke-linecap="round"/>
 
-    <path d="M289 197C289 183.193 300.193 172 314 172H392L411 191H534C547.807 191 559 202.193 559 216V306C559 319.807 547.807 331 534 331H314C300.193 331 289 319.807 289 306V197Z" fill="url(#folder)"/>
-    <rect x="322" y="226" width="201" height="18" rx="9" fill="#FFF1D6" fill-opacity="0.72"/>
-    <rect x="322" y="257" width="165" height="18" rx="9" fill="#FFF1D6" fill-opacity="0.58"/>
-    <rect x="322" y="288" width="184" height="18" rx="9" fill="#FFF1D6" fill-opacity="0.42"/>
+    <path d="M121 308C121 291.4 134.4 278 151 278H178C194.6 278 208 291.4 208 308V313" stroke="#3B5D7A" stroke-width="10" stroke-linecap="round"/>
+    <circle cx="121" cy="308" r="13" fill="#4E88F0"/>
+    <circle cx="151" cy="278" r="13" fill="#6BC9A0"/>
+    <circle cx="208" cy="313" r="13" fill="#F06A4C"/>
 
-    <path d="M418 188V158C418 146.402 427.402 137 439 137H504C515.598 137 525 146.402 525 158V179" stroke="#2B3C4C" stroke-width="6" stroke-linecap="round"/>
+    <path d="M304 343H377C392.5 343 405 330.5 405 315V285" stroke="#3B5D7A" stroke-width="10" stroke-linecap="round"/>
+    <circle cx="304" cy="343" r="13" fill="#F5B84C"/>
+    <circle cx="405" cy="285" r="13" fill="#4E88F0"/>
+    <circle cx="377" cy="343" r="13" fill="#6BC9A0"/>
 
-    <path d="M525 218H573C602.271 218 626 241.729 626 271C626 300.271 649.729 324 679 324H714" stroke="#3C5E7B" stroke-width="6" stroke-linecap="round"/>
-    <path d="M525 283H567C589.091 283 607 265.091 607 243C607 220.909 624.909 203 647 203H666" stroke="#3C5E7B" stroke-width="6" stroke-linecap="round"/>
-
-    <circle cx="525" cy="218" r="14" fill="#F46D5C"/>
-    <circle cx="525" cy="283" r="14" fill="#4B88F1"/>
-    <circle cx="607" cy="243" r="14" fill="#6DCAA0"/>
-    <circle cx="626" cy="271" r="14" fill="#FFC65C"/>
-    <circle cx="714" cy="324" r="14" fill="#F46D5C"/>
-    <circle cx="666" cy="203" r="14" fill="#4B88F1"/>
-
-    <path d="M598 152L603.746 165.254L617 171L603.746 176.746L598 190L592.254 176.746L579 171L592.254 165.254L598 152Z" fill="#78E6A7"/>
-    <path d="M664 355L668.583 364.417L678 369L668.583 373.583L664 383L659.417 373.583L650 369L659.417 364.417L664 355Z" fill="#4B88F1"/>
-
-    <rect x="258" y="353" width="126" height="28" rx="14" fill="#1A2430"/>
-    <text x="321" y="372" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, Liberation Mono, monospace" font-size="18" font-weight="700" fill="#F5F1E8">gitgud</text>
-
-    <text x="646" y="370" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, Liberation Mono, monospace" font-size="52" font-weight="800" fill="#DDE8F3">gg</text>
+    <circle cx="256" cy="256" r="136" stroke="#243244" stroke-width="10"/>
   </g>
 </svg>

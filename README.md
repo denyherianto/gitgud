@@ -3,7 +3,7 @@
 `gitgud` is a Rust CLI that adds a terminal UI and AI-assisted workflows on top of normal Git commands.
 
 <p align="center">
-  <img src="./assets/gitgud-repo-illustration.svg" alt="Stylized gitgud repository illustration" width="720">
+  <img src="./assets/gitgud-repo-illustration.svg" alt="gitgud mascot icon" width="220">
 </p>
 
 ## Features
