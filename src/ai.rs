@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{collections::BTreeMap, time::Duration};
 
 use anyhow::{Context, Result, anyhow, bail};
 use reqwest::{Client, Url};
@@ -75,6 +75,12 @@ pub struct PromptInput {
     pub commit_style: CommitStyle,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitSuggestions {
+    pub options: Vec<String>,
+    pub split: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct AiClient {
     config: AiConfig,
@@ -110,18 +116,27 @@ impl AiClient {
             .ok_or_else(|| anyhow!("AI provider returned no commit message options"))
     }
 
-    pub async fn generate_commit_options(&self, input: &PromptInput) -> Result<Vec<String>> {
-        match self.generate_commit_options_from_provider(input).await {
-            Ok(options) => Ok(options),
-            Err(error) if is_timeout_error(&error) => Ok(build_heuristic_commit_options(input)),
+    pub async fn generate_commit_suggestions(
+        &self,
+        input: &PromptInput,
+    ) -> Result<CommitSuggestions> {
+        match self.generate_commit_suggestions_from_provider(input).await {
+            Ok(suggestions) => Ok(suggestions),
+            Err(error) if is_timeout_error(&error) => Ok(build_heuristic_commit_suggestions(input)),
             Err(error) => Err(error),
         }
     }
 
-    async fn generate_commit_options_from_provider(
+    pub async fn generate_commit_options(&self, input: &PromptInput) -> Result<Vec<String>> {
+        self.generate_commit_suggestions(input)
+            .await
+            .map(|suggestions| suggestions.options)
+    }
+
+    async fn generate_commit_suggestions_from_provider(
         &self,
         input: &PromptInput,
-    ) -> Result<Vec<String>> {
+    ) -> Result<CommitSuggestions> {
         let endpoint = format!("{}/chat/completions", self.config.base_api_url);
         let request = ChatCompletionRequest {
             model: self.config.base_model.clone(),
@@ -166,7 +181,7 @@ impl AiClient {
             .map(|choice| choice.message.content)
             .ok_or_else(|| anyhow!("AI provider returned no choices"))?;
 
-        parse_commit_options(&content, input.commit_style)
+        parse_commit_suggestions(&content, input.commit_style)
     }
 }
 
@@ -259,7 +274,7 @@ pub fn validate_commit_message(raw: &str, commit_style: CommitStyle) -> Result<S
     Ok(message)
 }
 
-pub fn build_heuristic_commit_options(input: &PromptInput) -> Vec<String> {
+pub fn build_heuristic_commit_suggestions(input: &PromptInput) -> CommitSuggestions {
     let subject = describe_change_subject(&input.staged_files);
     let standard = [
         format!("Update {subject}"),
@@ -280,7 +295,14 @@ pub fn build_heuristic_commit_options(input: &PromptInput) -> Vec<String> {
         CommitStyle::Conventional => conventional,
     };
 
-    candidates.into_iter().map(limit_subject_to_72).collect()
+    CommitSuggestions {
+        options: candidates.into_iter().map(limit_subject_to_72).collect(),
+        split: build_heuristic_split_suggestions(input),
+    }
+}
+
+pub fn build_heuristic_commit_options(input: &PromptInput) -> Vec<String> {
+    build_heuristic_commit_suggestions(input).options
 }
 
 fn build_system_prompt(commit_style: CommitStyle) -> String {
@@ -294,11 +316,11 @@ fn build_system_prompt(commit_style: CommitStyle) -> String {
     };
 
     format!(
-        "You write concise Git commit messages. Return valid JSON only with this shape: {{\"options\":[\"message 1\",\"message 2\",\"message 3\"]}}. Provide 1 to 3 distinct options. Each option may include a blank line and body, but no markdown fences, labels, numbering, or commentary. Describe only the staged changes. {style_rules}"
+        "You write concise Git commit messages. Return valid JSON only with this shape: {{\"options\":[\"message 1\",\"message 2\",\"message 3\"],\"split\":[\"message a\",\"message b\"]}}. Provide 1 to 3 distinct options in `options`. Add `split` only when the staged changes mix multiple concerns that should be committed separately; when present, `split` must contain 2 to 4 commit messages that cleanly separate those concerns. Each message may include a blank line and body, but no markdown fences, labels, numbering, or commentary. Describe only the staged changes. {style_rules}"
     )
 }
 
-fn parse_commit_options(raw: &str, commit_style: CommitStyle) -> Result<Vec<String>> {
+fn parse_commit_suggestions(raw: &str, commit_style: CommitStyle) -> Result<CommitSuggestions> {
     let parsed = parse_options_payload(raw)?;
     if !(1..=3).contains(&parsed.options.len()) {
         bail!("AI provider must return between 1 and 3 commit message options");
@@ -309,7 +331,21 @@ fn parse_commit_options(raw: &str, commit_style: CommitStyle) -> Result<Vec<Stri
         options.push(validate_commit_message(&option, commit_style)?);
     }
 
-    Ok(options)
+    let mut split = Vec::with_capacity(parsed.split.len());
+    for message in parsed.split {
+        split.push(validate_commit_message(&message, commit_style)?);
+    }
+
+    if !split.is_empty() && !(2..=4).contains(&split.len()) {
+        bail!("AI provider split suggestions must contain between 2 and 4 messages");
+    }
+
+    Ok(CommitSuggestions { options, split })
+}
+
+#[cfg(test)]
+fn parse_commit_options(raw: &str, commit_style: CommitStyle) -> Result<Vec<String>> {
+    parse_commit_suggestions(raw, commit_style).map(|parsed| parsed.options)
 }
 
 fn parse_options_payload(raw: &str) -> Result<CommitOptionsPayload> {
@@ -382,6 +418,185 @@ fn is_timeout_error(error: &anyhow::Error) -> bool {
             .downcast_ref::<reqwest::Error>()
             .is_some_and(reqwest::Error::is_timeout)
     })
+}
+
+fn build_heuristic_split_suggestions(input: &PromptInput) -> Vec<String> {
+    let concerns = collect_concerns(input);
+    if concerns.len() < 2 {
+        return Vec::new();
+    }
+
+    concerns
+        .into_iter()
+        .take(4)
+        .map(|concern| limit_subject_to_72(build_split_message(&concern, input.commit_style)))
+        .collect()
+}
+
+fn build_split_message(concern: &Concern, commit_style: CommitStyle) -> String {
+    let is_fix = concern.diff_mentions_fix || concern.label.contains("fix");
+    let is_feature = concern.diff_mentions_feature;
+
+    match commit_style {
+        CommitStyle::Standard => {
+            if concern.kind == ConcernKind::Docs {
+                format!("Update {}", concern.label)
+            } else if concern.kind == ConcernKind::Tests {
+                format!("Expand {} coverage", concern.label)
+            } else if concern.kind == ConcernKind::Ci {
+                format!("Update {}", concern.label)
+            } else if is_fix {
+                format!("Fix {} handling", concern.label)
+            } else if is_feature {
+                format!("Add {}", concern.label)
+            } else {
+                format!("Update {}", concern.label)
+            }
+        }
+        CommitStyle::Conventional => {
+            let commit_type = match concern.kind {
+                ConcernKind::Docs => "docs",
+                ConcernKind::Tests => "test",
+                ConcernKind::Ci => "ci",
+                ConcernKind::Install | ConcernKind::Other => "chore",
+                ConcernKind::Source if is_fix => "fix",
+                ConcernKind::Source => "feat",
+            };
+            let scope = sanitize_scope(&concern.scope);
+            let description = match concern.kind {
+                ConcernKind::Docs => format!("update {}", concern.label),
+                ConcernKind::Tests => format!("expand {} coverage", concern.label),
+                ConcernKind::Ci | ConcernKind::Install | ConcernKind::Other => {
+                    format!("update {}", concern.label)
+                }
+                ConcernKind::Source if is_fix => format!("handle {}", concern.label),
+                ConcernKind::Source if is_feature => format!("add {}", concern.label),
+                ConcernKind::Source => format!("update {}", concern.label),
+            };
+
+            if scope.is_empty() {
+                format!("{commit_type}: {description}")
+            } else {
+                format!("{commit_type}({scope}): {description}")
+            }
+        }
+    }
+}
+
+fn collect_concerns(input: &PromptInput) -> Vec<Concern> {
+    let diffs_by_path = split_diff_by_path(&input.diff);
+    let mut concerns: Vec<Concern> = Vec::new();
+
+    for path in &input.staged_files {
+        let Some(mut concern) = classify_concern(path) else {
+            continue;
+        };
+
+        if let Some(diff) = diffs_by_path.get(path) {
+            let diff_lower = diff.to_ascii_lowercase();
+            concern.diff_mentions_fix = contains_any(
+                &diff_lower,
+                &[
+                    "null", "none", "missing", "fallback", "guard", "error", "handle",
+                ],
+            );
+            concern.diff_mentions_feature = contains_any(
+                &diff_lower,
+                &[
+                    "add ", "new ", "create", "card", "screen", "page", "summary",
+                ],
+            );
+        }
+
+        if let Some(existing) = concerns.iter_mut().find(|item| {
+            let item = &**item;
+            item.kind == concern.kind && item.scope == concern.scope && item.label == concern.label
+        }) {
+            existing.diff_mentions_fix |= concern.diff_mentions_fix;
+            existing.diff_mentions_feature |= concern.diff_mentions_feature;
+        } else {
+            concerns.push(concern);
+        }
+    }
+
+    concerns
+}
+
+fn classify_concern(path: &str) -> Option<Concern> {
+    if path == "README.md" || path.starts_with("docs/") {
+        return Some(Concern::new(ConcernKind::Docs, "docs", "documentation"));
+    }
+
+    if path.starts_with("tests/") {
+        let label = path
+            .strip_prefix("tests/")
+            .and_then(|rest| rest.split('/').next())
+            .and_then(|segment| segment.split('.').next())
+            .map(humanize_identifier)
+            .filter(|label| !label.is_empty())
+            .unwrap_or_else(|| "tests".to_string());
+        return Some(Concern::new(ConcernKind::Tests, "tests", &label));
+    }
+
+    if path.starts_with(".github/workflows/") {
+        return Some(Concern::new(ConcernKind::Ci, "release", "release workflow"));
+    }
+
+    if path == "install.sh" {
+        return Some(Concern::new(ConcernKind::Install, "install", "installer"));
+    }
+
+    if let Some(rest) = path.strip_prefix("src/") {
+        let module = rest
+            .split('/')
+            .next()
+            .and_then(|segment| segment.split('.').next())
+            .filter(|segment| !segment.is_empty())
+            .unwrap_or("project");
+        let label = humanize_identifier(module);
+        return Some(Concern::new(ConcernKind::Source, module, &label));
+    }
+
+    let top_level = path
+        .split('/')
+        .next()
+        .and_then(|segment| segment.split('.').next())
+        .filter(|segment| !segment.is_empty())?;
+    let label = humanize_identifier(top_level);
+    Some(Concern::new(ConcernKind::Other, top_level, &label))
+}
+
+fn split_diff_by_path(diff: &str) -> BTreeMap<String, String> {
+    let mut segments = BTreeMap::new();
+    let mut current_path: Option<String> = None;
+    let mut current_lines = String::new();
+
+    for line in diff.lines() {
+        if let Some(rest) = line.strip_prefix("diff --git a/") {
+            if let Some(path) = current_path.take() {
+                segments.insert(path, current_lines.trim().to_string());
+                current_lines.clear();
+            }
+
+            current_path = rest
+                .split_once(" b/")
+                .map(|(_, path)| path.to_string())
+                .or_else(|| rest.split_whitespace().nth(1).map(str::to_string));
+        } else if current_path.is_some() {
+            current_lines.push_str(line);
+            current_lines.push('\n');
+        }
+    }
+
+    if let Some(path) = current_path {
+        segments.insert(path, current_lines.trim().to_string());
+    }
+
+    segments
+}
+
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
 }
 
 fn describe_change_subject(staged_files: &[String]) -> String {
@@ -568,6 +783,39 @@ struct ChatResponseMessage {
 #[derive(Debug, Deserialize)]
 struct CommitOptionsPayload {
     options: Vec<String>,
+    #[serde(default)]
+    split: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Concern {
+    kind: ConcernKind,
+    scope: String,
+    label: String,
+    diff_mentions_fix: bool,
+    diff_mentions_feature: bool,
+}
+
+impl Concern {
+    fn new(kind: ConcernKind, scope: &str, label: &str) -> Self {
+        Self {
+            kind,
+            scope: scope.to_string(),
+            label: label.to_string(),
+            diff_mentions_fix: false,
+            diff_mentions_feature: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConcernKind {
+    Docs,
+    Tests,
+    Ci,
+    Install,
+    Source,
+    Other,
 }
 
 #[cfg(test)]
@@ -576,7 +824,8 @@ mod tests {
 
     use super::{
         AiConfig, DEFAULT_BASE_API_URL, build_commit_prompt, build_heuristic_commit_options,
-        normalize_base_api_url, parse_commit_options, truncate_diff, validate_commit_message,
+        build_heuristic_commit_suggestions, normalize_base_api_url, parse_commit_options,
+        parse_commit_suggestions, truncate_diff, validate_commit_message,
     };
     use crate::config::{CommitStyle, Provider};
 
@@ -664,6 +913,18 @@ mod tests {
     }
 
     #[test]
+    fn parses_split_commit_suggestions_json() {
+        let suggestions = parse_commit_suggestions(
+            r#"{"options":["Update billing flow"],"split":["Add billing summary card","Fix subscription status handling"]}"#,
+            CommitStyle::Standard,
+        )
+        .unwrap();
+
+        assert_eq!(suggestions.options.len(), 1);
+        assert_eq!(suggestions.split.len(), 2);
+    }
+
+    #[test]
     fn validates_conventional_commit_subjects() {
         let message = validate_commit_message(
             "feat(cli): add multiple commit message options",
@@ -702,5 +963,20 @@ mod tests {
         for option in options {
             validate_commit_message(&option, CommitStyle::Conventional).unwrap();
         }
+    }
+
+    #[test]
+    fn builds_split_suggestions_for_mixed_concerns() {
+        let suggestions = build_heuristic_commit_suggestions(&super::PromptInput {
+            branch: "feature/billing".into(),
+            staged_files: vec!["src/billing.rs".into(), "src/subscription.rs".into()],
+            diff_stat: "2 files changed".into(),
+            diff: "diff --git a/src/billing.rs b/src/billing.rs\n+fn billing_summary_card() {}\ndiff --git a/src/subscription.rs b/src/subscription.rs\n+if status == null {\n+    return;\n+}\n".into(),
+            commit_style: CommitStyle::Conventional,
+        });
+
+        assert_eq!(suggestions.split.len(), 2);
+        assert!(suggestions.split[0].contains("billing"));
+        assert!(suggestions.split[1].contains("subscription"));
     }
 }

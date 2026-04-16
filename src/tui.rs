@@ -22,7 +22,9 @@ use ratatui::{
 use tui_textarea::{Input, Key, TextArea};
 
 use crate::{
-    ai::{AiClient, PromptInput, normalize_base_api_url, validate_commit_message},
+    ai::{
+        AiClient, CommitSuggestions, PromptInput, normalize_base_api_url, validate_commit_message,
+    },
     config::{CommitStyle, Provider, TokenStatus},
     git::{GitRepo, PushPlan, RepoStatus},
 };
@@ -497,16 +499,35 @@ fn build_commit_help_line(state: &CommitView) -> Line<'static> {
 fn build_commit_status_lines(state: &CommitView) -> Vec<Line<'static>> {
     let status_text = match &state.generation {
         GenerationState::Loading => "Generating 1-3 commit message options from the staged diff...",
-        GenerationState::Ready => "Choose an option, edit if needed, then press Enter to commit.",
+        GenerationState::Ready if state.split_suggestions.is_empty() => {
+            "Choose an option, edit if needed, then press Enter to commit."
+        }
+        GenerationState::Ready => {
+            "Staged changes look mixed. Consider splitting them before committing."
+        }
         GenerationState::Error(error) => error.as_str(),
     };
 
-    vec![
+    let mut lines = vec![
         Line::from(format!("Style: {}", state.commit_style)),
         Line::from(format!("Staged count: {}", state.staged_files.len())),
         Line::from("Left/Right scroll staged tree  PgUp/PgDn jump  Home/End edges"),
         Line::from(status_text.to_string()),
-    ]
+    ];
+
+    if matches!(state.generation, GenerationState::Ready) && !state.split_suggestions.is_empty() {
+        lines.push(Line::from(vec![Span::styled(
+            "Suggested split:",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )]));
+        for suggestion in &state.split_suggestions {
+            lines.push(Line::from(format!("  - {suggestion}")));
+        }
+    }
+
+    lines
 }
 
 fn staged_files_tree_lines(staged_files: &[String]) -> Vec<Line<'static>> {
@@ -746,10 +767,11 @@ struct CommitView {
     generation: GenerationState,
     mode: CommitMode,
     staged_files: Vec<String>,
-    receiver: Option<Receiver<Result<Vec<String>>>>,
+    receiver: Option<Receiver<Result<CommitSuggestions>>>,
     generator: Option<(AiClient, PromptInput)>,
     options: Vec<String>,
     drafts: Vec<String>,
+    split_suggestions: Vec<String>,
     list_state: ListState,
     staged_scroll: usize,
     confirmed_message: Option<String>,
@@ -768,6 +790,7 @@ impl CommitView {
             generator: None,
             options: Vec::new(),
             drafts: Vec::new(),
+            split_suggestions: Vec::new(),
             list_state: ListState::default().with_selected(Some(0)),
             staged_scroll: 0,
             confirmed_message: None,
@@ -797,12 +820,13 @@ impl CommitView {
         self.mode = CommitMode::Browsing;
         self.options.clear();
         self.drafts.clear();
+        self.split_suggestions.clear();
         self.list_state.select(Some(0));
         self.staged_scroll = 0;
         self.textarea = make_textarea("Draft", "Generating commit message options...");
 
         tokio::spawn(async move {
-            let result = ai.generate_commit_options(&input).await;
+            let result = ai.generate_commit_suggestions(&input).await;
             let _ = tx.send(result);
         });
     }
@@ -816,9 +840,10 @@ impl CommitView {
             Ok(result) => {
                 self.receiver = None;
                 match result {
-                    Ok(options) => {
-                        self.options = options.clone();
-                        self.drafts = options;
+                    Ok(suggestions) => {
+                        self.options = suggestions.options.clone();
+                        self.drafts = suggestions.options;
+                        self.split_suggestions = suggestions.split;
                         self.list_state.select(Some(0));
                         self.load_selected_draft();
                         self.generation = GenerationState::Ready;
@@ -1216,7 +1241,10 @@ impl FileTreeNode {
 
 #[cfg(test)]
 mod tests {
-    use super::staged_files_tree_lines;
+    use super::{
+        CommitMode, CommitView, GenerationState, build_commit_status_lines, staged_files_tree_lines,
+    };
+    use crate::config::CommitStyle;
 
     fn plain_text(lines: Vec<ratatui::text::Line<'static>>) -> Vec<String> {
         lines
@@ -1228,6 +1256,13 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    fn ready_commit_view() -> CommitView {
+        let mut state = CommitView::new(vec!["src/tui.rs".to_string()], CommitStyle::Standard);
+        state.generation = GenerationState::Ready;
+        state.mode = CommitMode::Browsing;
+        state
     }
 
     #[test]
@@ -1262,5 +1297,37 @@ mod tests {
         assert_eq!(lines.len(), 4);
         assert_eq!(lines[0], "|-- f a.rs");
         assert_eq!(lines[3], "`-- f d.rs");
+    }
+
+    #[test]
+    fn shows_split_suggestions_in_commit_status() {
+        let mut state = ready_commit_view();
+        state.split_suggestions = vec![
+            "feat(billing): add billing summary card".to_string(),
+            "fix(subscription): handle null subscription status".to_string(),
+        ];
+
+        let lines = plain_text(build_commit_status_lines(&state));
+
+        assert!(lines.contains(
+            &"Staged changes look mixed. Consider splitting them before committing.".to_string()
+        ));
+        assert!(lines.contains(&"Suggested split:".to_string()));
+        assert!(lines.contains(&"  - feat(billing): add billing summary card".to_string()));
+        assert!(
+            lines.contains(&"  - fix(subscription): handle null subscription status".to_string())
+        );
+    }
+
+    #[test]
+    fn omits_split_section_when_not_needed() {
+        let state = ready_commit_view();
+
+        let lines = plain_text(build_commit_status_lines(&state));
+
+        assert!(lines.contains(
+            &"Choose an option, edit if needed, then press Enter to commit.".to_string()
+        ));
+        assert!(!lines.contains(&"Suggested split:".to_string()));
     }
 }

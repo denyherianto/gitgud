@@ -44,6 +44,42 @@ async fn generates_commit_message_from_mock_server() {
 }
 
 #[tokio::test]
+async fn surfaces_split_commit_suggestions_from_mock_server() {
+    let mut server = Server::new_async().await;
+    let _mock = server
+        .mock("POST", "/chat/completions")
+        .match_header("authorization", "Bearer token")
+        .with_status(200)
+        .with_body(r#"{"choices":[{"message":{"content":"{\"options\":[\"feat(billing): update billing and subscription flow\"],\"split\":[\"feat(billing): add billing summary card\",\"fix(subscription): handle null subscription status\"]}"}}]}"#)
+        .create_async()
+        .await;
+
+    let config = AiConfig::new(
+        "token".into(),
+        Provider::Gemini,
+        &server.url(),
+        "model",
+        CommitStyle::Conventional,
+    )
+    .unwrap();
+    let client = AiClient::new(config).unwrap();
+    let suggestions = client
+        .generate_commit_suggestions(&PromptInput {
+            commit_style: CommitStyle::Conventional,
+            ..prompt()
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(suggestions.options.len(), 1);
+    assert_eq!(suggestions.split.len(), 2);
+    assert_eq!(
+        suggestions.split[0],
+        "feat(billing): add billing summary card"
+    );
+}
+
+#[tokio::test]
 async fn surfaces_auth_errors() {
     let mut server = Server::new_async().await;
     let _mock = server

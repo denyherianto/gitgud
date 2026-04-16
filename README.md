@@ -9,6 +9,7 @@
 ## Features
 
 - Generate 1-3 commit message options from the staged diff
+- Detect mixed staged concerns and suggest cleaner split commits before you commit
 - Choose an option in the TUI and edit it inline before committing
 - Support standard and Conventional Commits styles
 - Push the current branch to its upstream automatically
@@ -142,6 +143,7 @@ gg git push --force-with-lease
 - requires staged changes
 - reads the staged diff
 - asks the configured AI provider for 1-3 commit message options
+- warns when the staged diff looks like multiple concerns and suggests split commits
 - lets you choose one option in the TUI
 - supports inline editing before commit
 - respects the configured commit style, including Conventional Commits mode
@@ -201,6 +203,7 @@ cargo test
 
 ## Open Source
 
+- Contributor note: keep `README.md` updated in the same change as any user-visible behavior or workflow change, and add or update tests for behavior changes where appropriate. Agent contributor guidance for Codex, Claude Code, and similar tools lives in `AGENTS.md`.
 - License: MIT, see `LICENSE`
 - Contributions: see `CONTRIBUTING.md`
 - Community expectations: see `CODE_OF_CONDUCT.md`
