@@ -68,8 +68,12 @@ async fn surfaces_split_commit_suggestions_from_mock_server() {
     let client = AiClient::new(config).unwrap();
     let suggestions = client
         .generate_commit_suggestions(&PromptInput {
+            branch: "feature/billing".into(),
+            staged_files: vec!["src/billing.rs".into(), "src/subscription.rs".into()],
+            diff_stat: "2 files changed".into(),
+            diff: "diff --git a/src/billing.rs b/src/billing.rs\n+fn billing_summary_card() {}\ndiff --git a/src/subscription.rs b/src/subscription.rs\n+if status == null {\n+    return;\n+}\n".into(),
             commit_style: CommitStyle::Conventional,
-            ..prompt()
+            conventional_preset: ResolvedConventionalPreset::built_in_default(),
         })
         .await
         .unwrap();
@@ -77,8 +81,12 @@ async fn surfaces_split_commit_suggestions_from_mock_server() {
     assert_eq!(suggestions.options.len(), 1);
     assert_eq!(suggestions.split.len(), 2);
     assert_eq!(
-        suggestions.split[0],
+        suggestions.split[0].message,
         "feat(billing): add billing summary card"
+    );
+    assert_eq!(
+        suggestions.split[0].files,
+        vec!["src/billing.rs".to_string()]
     );
 }
 

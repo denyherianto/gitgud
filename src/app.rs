@@ -92,6 +92,19 @@ async fn run_commit(repo: &GitRepo) -> Result<()> {
             }
             Ok(())
         }
+        CommitAction::SplitRequested(plans) => {
+            if !tui::confirm_split_commits(&plans)? {
+                println!("split commit cancelled");
+                return Ok(());
+            }
+
+            repo.split_commit(&plans)?;
+            println!("created {} split commits", plans.len());
+            for plan in plans {
+                println!("- {}", plan.message.lines().next().unwrap_or("(empty)"));
+            }
+            Ok(())
+        }
         CommitAction::Cancelled => {
             println!("commit cancelled");
             Ok(())

@@ -1,10 +1,10 @@
 use std::{collections::BTreeMap, time::Duration};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{CommitStyle, Provider, ResolvedConventionalPreset, resolve_ai_settings};
+use crate::config::{resolve_ai_settings, CommitStyle, Provider, ResolvedConventionalPreset};
 
 pub const DEFAULT_PROVIDER: Provider = Provider::Gemini;
 pub const DEFAULT_BASE_API_URL: &str = "https://generativelanguage.googleapis.com/v1beta/openai";
@@ -83,7 +83,13 @@ pub struct PromptInput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitSuggestions {
     pub options: Vec<String>,
-    pub split: Vec<String>,
+    pub split: Vec<SplitCommitPlan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SplitCommitPlan {
+    pub message: String,
+    pub files: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -188,6 +194,7 @@ impl AiClient {
 
         parse_commit_suggestions_with_preset(
             &content,
+            input,
             input.commit_style,
             &input.conventional_preset,
         )
@@ -352,14 +359,24 @@ fn build_system_prompt(
     };
 
     format!(
-        "You write concise Git commit messages. Return valid JSON only with this shape: {{\"options\":[\"message 1\",\"message 2\",\"message 3\"],\"split\":[\"message a\",\"message b\"]}}. Provide 1 to 3 distinct options in `options`. Add `split` only when the staged changes mix multiple concerns that should be committed separately; when present, `split` must contain 2 to 4 commit messages that cleanly separate those concerns. Each message may include a blank line and body, but no markdown fences, labels, numbering, or commentary. Describe only the staged changes. {style_rules}"
+        "You write concise Git commit messages. Return valid JSON only with this shape: {{\"options\":[\"message 1\",\"message 2\",\"message 3\"],\"split\":[{{\"message\":\"message a\",\"files\":[\"path/a.rs\"]}},{{\"message\":\"message b\",\"files\":[\"path/b.rs\"]}}]}}. Provide 1 to 3 distinct options in `options`. Add `split` only when the staged changes mix multiple concerns that should be committed separately; when present, `split` must contain 2 to 4 objects and each object must include a commit `message` plus the staged `files` that belong in that commit. The split plan must cover every staged file exactly once. Each message may include a blank line and body, but no markdown fences, labels, numbering, or commentary. Describe only the staged changes. {style_rules}"
     )
 }
 
 #[cfg(test)]
 fn parse_commit_suggestions(raw: &str, commit_style: CommitStyle) -> Result<CommitSuggestions> {
+    let input = PromptInput {
+        branch: "feature/billing".into(),
+        staged_files: vec!["src/billing.rs".into(), "src/subscription.rs".into()],
+        diff_stat: "2 files changed".into(),
+        diff: "diff --git a/src/billing.rs b/src/billing.rs\n+fn billing_summary_card() {}\ndiff --git a/src/subscription.rs b/src/subscription.rs\n+if status == null {\n+    return;\n+}\n".into(),
+        commit_style,
+        conventional_preset: ResolvedConventionalPreset::built_in_default(),
+    };
+
     parse_commit_suggestions_with_preset(
         raw,
+        &input,
         commit_style,
         &ResolvedConventionalPreset::built_in_default(),
     )
@@ -367,6 +384,7 @@ fn parse_commit_suggestions(raw: &str, commit_style: CommitStyle) -> Result<Comm
 
 fn parse_commit_suggestions_with_preset(
     raw: &str,
+    input: &PromptInput,
     commit_style: CommitStyle,
     conventional_preset: &ResolvedConventionalPreset,
 ) -> Result<CommitSuggestions> {
@@ -377,25 +395,18 @@ fn parse_commit_suggestions_with_preset(
 
     let mut options = Vec::with_capacity(parsed.options.len());
     for option in parsed.options {
-        options.push(validate_commit_message_with_preset(
+        options.push(normalize_generated_commit_message_with_preset(
             &option,
             commit_style,
             conventional_preset,
         )?);
     }
 
-    let mut split = Vec::with_capacity(parsed.split.len());
-    for message in parsed.split {
-        split.push(validate_commit_message_with_preset(
-            &message,
-            commit_style,
-            conventional_preset,
-        )?);
-    }
-
-    if !split.is_empty() && !(2..=4).contains(&split.len()) {
+    if !parsed.split.is_empty() && !(2..=4).contains(&parsed.split.len()) {
         bail!("AI provider split suggestions must contain between 2 and 4 messages");
     }
+
+    let split = resolve_split_plans(parsed.split, input, commit_style, conventional_preset)?;
 
     Ok(CommitSuggestions { options, split })
 }
@@ -404,10 +415,115 @@ fn parse_commit_suggestions_with_preset(
 fn parse_commit_options(raw: &str, commit_style: CommitStyle) -> Result<Vec<String>> {
     parse_commit_suggestions_with_preset(
         raw,
+        &PromptInput {
+            branch: "main".into(),
+            staged_files: vec!["src/main.rs".into()],
+            diff_stat: String::new(),
+            diff: String::new(),
+            commit_style,
+            conventional_preset: ResolvedConventionalPreset::built_in_default(),
+        },
         commit_style,
         &ResolvedConventionalPreset::built_in_default(),
     )
     .map(|parsed| parsed.options)
+}
+
+fn resolve_split_plans(
+    split: Vec<SplitPlanPayload>,
+    input: &PromptInput,
+    commit_style: CommitStyle,
+    conventional_preset: &ResolvedConventionalPreset,
+) -> Result<Vec<SplitCommitPlan>> {
+    if split.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let heuristic = build_heuristic_split_suggestions(input);
+    let all_structured = split
+        .iter()
+        .all(|item| matches!(item, SplitPlanPayload::Plan { .. }));
+    if all_structured {
+        let provider =
+            validate_provider_split_plans(split, input, commit_style, conventional_preset)?;
+        return Ok(provider);
+    }
+
+    if heuristic.len() == split.len() {
+        let mut plans = Vec::with_capacity(split.len());
+        for (item, heuristic_plan) in split.into_iter().zip(heuristic) {
+            let message = match item {
+                SplitPlanPayload::Message(message) => message,
+                SplitPlanPayload::Plan { message, .. } => message,
+            };
+            plans.push(SplitCommitPlan {
+                message: normalize_generated_commit_message_with_preset(
+                    &message,
+                    commit_style,
+                    conventional_preset,
+                )?,
+                files: heuristic_plan.files,
+            });
+        }
+        return Ok(plans);
+    }
+
+    Ok(heuristic)
+}
+
+fn validate_provider_split_plans(
+    split: Vec<SplitPlanPayload>,
+    input: &PromptInput,
+    commit_style: CommitStyle,
+    conventional_preset: &ResolvedConventionalPreset,
+) -> Result<Vec<SplitCommitPlan>> {
+    let mut plans = Vec::with_capacity(split.len());
+    let mut seen_files = BTreeMap::new();
+    let staged_files = input
+        .staged_files
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+
+    for item in split {
+        let SplitPlanPayload::Plan { message, files } = item else {
+            bail!("AI provider split suggestions must include files");
+        };
+        if files.is_empty() {
+            bail!("AI provider split suggestions must include at least one file per commit");
+        }
+
+        let mut unique_files = Vec::with_capacity(files.len());
+        for file in files {
+            if !staged_files.iter().any(|staged| *staged == file) {
+                bail!("AI provider split suggestions referenced an unstaged file: {file}");
+            }
+            if seen_files.insert(file.clone(), message.clone()).is_none() {
+                unique_files.push(file);
+            } else {
+                bail!("AI provider split suggestions assigned a file to multiple commits");
+            }
+        }
+
+        plans.push(SplitCommitPlan {
+            message: normalize_generated_commit_message_with_preset(
+                &message,
+                commit_style,
+                conventional_preset,
+            )?,
+            files: unique_files,
+        });
+    }
+
+    if input
+        .staged_files
+        .iter()
+        .any(|file| !seen_files.contains_key(file))
+    {
+        bail!("AI provider split suggestions must cover every staged file");
+    }
+
+    Ok(plans)
 }
 
 fn parse_options_payload(raw: &str) -> Result<CommitOptionsPayload> {
@@ -481,6 +597,75 @@ fn validate_conventional_subject(subject: &str, allowed_types: &[String]) -> Res
     Ok(())
 }
 
+fn normalize_generated_commit_message_with_preset(
+    raw: &str,
+    commit_style: CommitStyle,
+    conventional_preset: &ResolvedConventionalPreset,
+) -> Result<String> {
+    let normalized = raw.replace("\r\n", "\n");
+    let lines: Vec<String> = normalized
+        .lines()
+        .map(str::trim_end)
+        .skip_while(|line| line.is_empty())
+        .map(str::to_string)
+        .collect();
+
+    let Some((subject, body)) = lines.split_first() else {
+        return validate_commit_message_with_preset(raw, commit_style, conventional_preset);
+    };
+
+    let subject = shorten_generated_subject(subject, commit_style);
+    let candidate = if body.is_empty() {
+        subject
+    } else {
+        format!("{subject}\n{}", body.join("\n"))
+    };
+
+    validate_commit_message_with_preset(&candidate, commit_style, conventional_preset)
+}
+
+fn shorten_generated_subject(subject: &str, commit_style: CommitStyle) -> String {
+    if subject.chars().count() <= 72 {
+        return subject.to_string();
+    }
+
+    if matches!(commit_style, CommitStyle::Conventional) {
+        if let Some((head, description)) = subject.split_once(": ") {
+            let available = 72usize.saturating_sub(head.chars().count() + 2);
+            if available > 0 {
+                let shortened_description = shorten_text_to_limit(description, available);
+                if !shortened_description.is_empty() {
+                    return format!("{head}: {shortened_description}");
+                }
+            }
+        }
+    }
+
+    shorten_text_to_limit(subject, 72)
+}
+
+fn shorten_text_to_limit(raw: &str, limit: usize) -> String {
+    if raw.chars().count() <= limit {
+        return raw.to_string();
+    }
+
+    let truncated = raw.chars().take(limit).collect::<String>();
+    let boundary = truncated
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| ch.is_whitespace() || *ch == '-' || *ch == ',' || *ch == ';')
+        .map(|(index, _)| index);
+
+    boundary
+        .and_then(|index| {
+            let candidate = truncated[..index]
+                .trim_end_matches([' ', '-', ',', ';', ':'])
+                .trim_end();
+            (!candidate.is_empty()).then(|| candidate.to_string())
+        })
+        .unwrap_or_else(|| truncated.trim_end().to_string())
+}
+
 fn is_timeout_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         cause
@@ -489,7 +674,7 @@ fn is_timeout_error(error: &anyhow::Error) -> bool {
     })
 }
 
-fn build_heuristic_split_suggestions(input: &PromptInput) -> Vec<String> {
+fn build_heuristic_split_suggestions(input: &PromptInput) -> Vec<SplitCommitPlan> {
     let concerns = collect_concerns(input);
     if concerns.len() < 2 {
         return Vec::new();
@@ -499,11 +684,15 @@ fn build_heuristic_split_suggestions(input: &PromptInput) -> Vec<String> {
         .into_iter()
         .take(4)
         .map(|concern| {
-            limit_subject_to_72(build_split_message(
+            let message = limit_subject_to_72(build_split_message(
                 &concern,
                 input.commit_style,
                 &input.conventional_preset.types,
-            ))
+            ));
+            SplitCommitPlan {
+                message,
+                files: concern.files,
+            }
         })
         .collect()
 }
@@ -596,7 +785,9 @@ fn collect_concerns(input: &PromptInput) -> Vec<Concern> {
         }) {
             existing.diff_mentions_fix |= concern.diff_mentions_fix;
             existing.diff_mentions_feature |= concern.diff_mentions_feature;
+            existing.files.push(path.clone());
         } else {
+            concern.files.push(path.clone());
             concerns.push(concern);
         }
     }
@@ -907,7 +1098,14 @@ struct ChatResponseMessage {
 struct CommitOptionsPayload {
     options: Vec<String>,
     #[serde(default)]
-    split: Vec<String>,
+    split: Vec<SplitPlanPayload>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum SplitPlanPayload {
+    Message(String),
+    Plan { message: String, files: Vec<String> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -917,6 +1115,7 @@ struct Concern {
     label: String,
     diff_mentions_fix: bool,
     diff_mentions_feature: bool,
+    files: Vec<String>,
 }
 
 impl Concern {
@@ -927,6 +1126,7 @@ impl Concern {
             label: label.to_string(),
             diff_mentions_fix: false,
             diff_mentions_feature: false,
+            files: Vec::new(),
         }
     }
 }
@@ -946,10 +1146,10 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        AiConfig, DEFAULT_BASE_API_URL, build_commit_prompt, build_heuristic_commit_options,
-        build_heuristic_commit_suggestions, normalize_base_api_url, parse_commit_options,
-        parse_commit_suggestions, truncate_diff, validate_commit_message,
-        validate_commit_message_with_preset,
+        build_commit_prompt, build_heuristic_commit_options, build_heuristic_commit_suggestions,
+        normalize_base_api_url, parse_commit_options, parse_commit_suggestions,
+        parse_commit_suggestions_with_preset, truncate_diff, validate_commit_message,
+        validate_commit_message_with_preset, AiConfig, SplitCommitPlan, DEFAULT_BASE_API_URL,
     };
     use crate::config::{CommitStyle, Provider, ResolvedConventionalPreset};
 
@@ -1059,6 +1259,36 @@ mod tests {
     }
 
     #[test]
+    fn trims_long_generated_standard_subjects() {
+        let options = parse_commit_options(
+            r#"{"options":["Add support for configurable conventional commit presets in the interactive setup flow"]}"#,
+            CommitStyle::Standard,
+        )
+        .unwrap();
+
+        assert_eq!(
+            options[0],
+            "Add support for configurable conventional commit presets in the"
+        );
+        assert!(options[0].chars().count() <= 72);
+    }
+
+    #[test]
+    fn trims_long_generated_conventional_subjects() {
+        let options = parse_commit_options(
+            r#"{"options":["feat(config): add support for configurable conventional commit presets in setup flow"]}"#,
+            CommitStyle::Conventional,
+        )
+        .unwrap();
+
+        assert_eq!(
+            options[0],
+            "feat(config): add support for configurable conventional commit presets"
+        );
+        assert!(options[0].chars().count() <= 72);
+    }
+
+    #[test]
     fn parses_split_commit_suggestions_json() {
         let suggestions = parse_commit_suggestions(
             r#"{"options":["Update billing flow"],"split":["Add billing summary card","Fix subscription status handling"]}"#,
@@ -1068,6 +1298,38 @@ mod tests {
 
         assert_eq!(suggestions.options.len(), 1);
         assert_eq!(suggestions.split.len(), 2);
+        assert_eq!(suggestions.split[0].message, "Add billing summary card");
+        assert_eq!(
+            suggestions.split[0].files,
+            vec!["src/billing.rs".to_string()]
+        );
+    }
+
+    #[test]
+    fn trims_long_generated_split_messages() {
+        let input = super::PromptInput {
+            branch: "main".into(),
+            staged_files: vec!["src/main.rs".into(), "src/lib.rs".into()],
+            diff_stat: "2 files changed".into(),
+            diff: "diff --git a/src/main.rs b/src/main.rs\ndiff --git a/src/lib.rs b/src/lib.rs"
+                .into(),
+            commit_style: CommitStyle::Conventional,
+            conventional_preset: default_preset(),
+        };
+        let preset = default_preset();
+        let suggestions = parse_commit_suggestions_with_preset(
+            r#"{"options":["feat(billing): update billing flow"],"split":[{"message":"feat(billing): add billing summary card and improve subscription status visibility","files":["src/main.rs"]},{"message":"fix(billing): handle missing customer payment profile details safely","files":["src/lib.rs"]}]}"#,
+            &input,
+            CommitStyle::Conventional,
+            &preset,
+        )
+        .unwrap();
+
+        assert_eq!(suggestions.split.len(), 2);
+        assert!(suggestions
+            .split
+            .iter()
+            .all(|plan| plan.message.chars().count() <= 72));
     }
 
     #[test]
@@ -1152,8 +1414,16 @@ mod tests {
         });
 
         assert_eq!(suggestions.split.len(), 2);
-        assert!(suggestions.split[0].contains("billing"));
-        assert!(suggestions.split[1].contains("subscription"));
+        assert!(suggestions.split[0].message.contains("billing"));
+        assert_eq!(
+            suggestions.split[0].files,
+            vec!["src/billing.rs".to_string()]
+        );
+        assert!(suggestions.split[1].message.contains("subscription"));
+        assert_eq!(
+            suggestions.split[1].files,
+            vec!["src/subscription.rs".to_string()]
+        );
     }
 
     #[test]
@@ -1170,8 +1440,14 @@ mod tests {
         assert_eq!(
             suggestions.split,
             vec![
-                "Update documentation".to_string(),
-                "Expand ai provider coverage".to_string(),
+                SplitCommitPlan {
+                    message: "Update documentation".to_string(),
+                    files: vec!["README.md".to_string()],
+                },
+                SplitCommitPlan {
+                    message: "Expand ai provider coverage".to_string(),
+                    files: vec!["tests/ai_provider.rs".to_string()],
+                },
             ]
         );
     }

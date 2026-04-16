@@ -9,7 +9,7 @@
 ## Features
 
 - Generate 1-3 commit message options from the staged diff
-- Detect mixed staged concerns and suggest cleaner split commits before you commit
+- Detect mixed staged concerns and let you approve file-based split commits in the TUI
 - Choose an option in the TUI and edit it inline before committing
 - Support standard and Conventional Commits styles, including configurable presets
 - Push the current branch to its upstream automatically
@@ -177,17 +177,20 @@ gg git push --force-with-lease
 - requires staged changes
 - reads the staged diff
 - asks the configured AI provider for 1-3 commit message options
-- warns when the staged diff looks like multiple concerns and suggests split commits
+- shortens overlong AI-generated subjects to fit the 72-character subject limit
+- shows when the staged diff looks like multiple concerns and offers a file-based split commit plan in the TUI
 - lets you choose one option in the TUI
 - supports inline editing before commit
 - respects the configured commit style, including Conventional Commits presets
 - commits only after confirmation
+- can create the proposed split commits after explicit approval with `s`
 
 Keys:
 
 - `Up`/`Down` choose an option
 - `r` regenerate
 - `e` enter edit mode
+- `s` approve the proposed split plan and create separate commits
 - `Enter` confirm commit
 - `Esc` cancel
 - `Ctrl-S` leave edit mode

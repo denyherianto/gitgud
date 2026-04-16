@@ -23,7 +23,7 @@ use tui_textarea::{Input, Key, TextArea};
 
 use crate::{
     ai::{
-        AiClient, CommitSuggestions, PromptInput, normalize_base_api_url,
+        AiClient, CommitSuggestions, PromptInput, SplitCommitPlan, normalize_base_api_url,
         validate_commit_message_with_preset,
     },
     config::{CommitStyle, Provider, ResolvedConventionalPreset, TokenStatus},
@@ -41,6 +41,7 @@ pub enum HomeAction {
 
 pub enum CommitAction {
     Confirmed(String),
+    SplitRequested(Vec<SplitCommitPlan>),
     Cancelled,
 }
 
@@ -129,6 +130,10 @@ pub fn confirm_stage_all_changes() -> Result<bool> {
     with_terminal(stage_all_changes_loop)
 }
 
+pub fn confirm_split_commits(plans: &[SplitCommitPlan]) -> Result<bool> {
+    with_terminal(|terminal| split_commit_confirm_loop(terminal, plans))
+}
+
 pub fn show_message(title: &str, message: &str) -> Result<()> {
     with_terminal(|terminal| {
         loop {
@@ -159,6 +164,9 @@ fn commit_loop(terminal: &mut AppTerminal, state: &mut CommitView) -> Result<Com
                     if handle_commit_browsing_key(state, key)? {
                         if let Some(message) = state.take_confirmed_message() {
                             return Ok(CommitAction::Confirmed(message));
+                        }
+                        if let Some(plans) = state.take_split_request() {
+                            return Ok(CommitAction::SplitRequested(plans));
                         }
                         if state.cancelled {
                             return Ok(CommitAction::Cancelled);
@@ -227,6 +235,23 @@ fn stage_all_changes_loop(terminal: &mut AppTerminal) -> Result<bool> {
     }
 }
 
+fn split_commit_confirm_loop(
+    terminal: &mut AppTerminal,
+    plans: &[SplitCommitPlan],
+) -> Result<bool> {
+    loop {
+        terminal.draw(|frame| draw_split_commit_confirm(frame, plans))?;
+
+        if let Event::Key(key) = event::read()? {
+            match key.code {
+                KeyCode::Enter => return Ok(true),
+                KeyCode::Esc => return Ok(false),
+                _ => {}
+            }
+        }
+    }
+}
+
 fn handle_commit_browsing_key(state: &mut CommitView, key: KeyEvent) -> Result<bool> {
     match key.code {
         KeyCode::Up => {
@@ -269,6 +294,13 @@ fn handle_commit_browsing_key(state: &mut CommitView, key: KeyEvent) -> Result<b
             if matches!(state.generation, GenerationState::Ready) && !state.drafts.is_empty() {
                 state.mode = CommitMode::Editing;
                 state.textarea.set_cursor_line_style(Style::default());
+            }
+            Ok(false)
+        }
+        KeyCode::Char('s') => {
+            if matches!(state.generation, GenerationState::Ready) && !state.split_plans.is_empty() {
+                state.split_requested = Some(state.split_plans.clone());
+                return Ok(true);
             }
             Ok(false)
         }
@@ -492,6 +524,8 @@ fn build_commit_help_line(state: &CommitView) -> Line<'static> {
             Span::raw(" edit  "),
             Span::styled("r", key_style),
             Span::raw(" regenerate  "),
+            Span::styled("s", key_style),
+            Span::raw(" split  "),
             Span::styled("Enter", key_style),
             Span::raw(" commit  "),
             Span::styled("Esc", key_style),
@@ -510,12 +544,10 @@ fn build_commit_help_line(state: &CommitView) -> Line<'static> {
 fn build_commit_status_lines(state: &CommitView) -> Vec<Line<'static>> {
     let status_text = match &state.generation {
         GenerationState::Loading => "Generating 1-3 commit message options from the staged diff...",
-        GenerationState::Ready if state.split_suggestions.is_empty() => {
+        GenerationState::Ready if state.split_plans.is_empty() => {
             "Choose an option, edit if needed, then press Enter to commit."
         }
-        GenerationState::Ready => {
-            "Staged changes look mixed. Consider splitting them before committing."
-        }
+        GenerationState::Ready => "Staged changes look mixed. Press s to let gitgud split them.",
         GenerationState::Error(error) => error.as_str(),
     };
 
@@ -545,15 +577,15 @@ fn build_commit_status_lines(state: &CommitView) -> Vec<Line<'static>> {
         );
     }
 
-    if matches!(state.generation, GenerationState::Ready) && !state.split_suggestions.is_empty() {
+    if matches!(state.generation, GenerationState::Ready) && !state.split_plans.is_empty() {
         lines.push(Line::from(vec![Span::styled(
-            "Suggested split:",
+            "Split plan:",
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         )]));
-        for suggestion in &state.split_suggestions {
-            lines.push(Line::from(format!("  - {suggestion}")));
+        for plan in &state.split_plans {
+            lines.push(Line::from(format!("  - {}", plan.message)));
         }
     }
 
@@ -658,6 +690,22 @@ fn draw_stage_all_changes_confirm(frame: &mut ratatui::Frame<'_>) {
         "Stage All Changes",
         "No staged changes found.\n\nPress Enter to stage all tracked and untracked changes with git add --all, or Esc to cancel.",
     );
+}
+
+fn draw_split_commit_confirm(frame: &mut ratatui::Frame<'_>, plans: &[SplitCommitPlan]) {
+    let mut lines = vec![
+        "gitgud will clear the current index, restage each group, and create one commit per plan."
+            .to_string(),
+        String::new(),
+    ];
+    for plan in plans {
+        lines.push(format!("- {}", plan.message));
+        lines.push(format!("  files: {}", plan.files.join(", ")));
+    }
+    lines.push(String::new());
+    lines.push("Press Enter to create these split commits, or Esc to cancel.".to_string());
+
+    draw_message(frame, "Split Commit Confirmation", &lines.join("\n"));
 }
 
 fn draw_message(frame: &mut ratatui::Frame<'_>, title: &str, message: &str) {
@@ -801,10 +849,11 @@ struct CommitView {
     generator: Option<(AiClient, PromptInput)>,
     options: Vec<String>,
     drafts: Vec<String>,
-    split_suggestions: Vec<String>,
+    split_plans: Vec<SplitCommitPlan>,
     list_state: ListState,
     staged_scroll: usize,
     confirmed_message: Option<String>,
+    split_requested: Option<Vec<SplitCommitPlan>>,
     cancelled: bool,
     commit_style: CommitStyle,
     conventional_preset: ResolvedConventionalPreset,
@@ -825,10 +874,11 @@ impl CommitView {
             generator: None,
             options: Vec::new(),
             drafts: Vec::new(),
-            split_suggestions: Vec::new(),
+            split_plans: Vec::new(),
             list_state: ListState::default().with_selected(Some(0)),
             staged_scroll: 0,
             confirmed_message: None,
+            split_requested: None,
             cancelled: false,
             commit_style,
             conventional_preset,
@@ -856,9 +906,10 @@ impl CommitView {
         self.mode = CommitMode::Browsing;
         self.options.clear();
         self.drafts.clear();
-        self.split_suggestions.clear();
+        self.split_plans.clear();
         self.list_state.select(Some(0));
         self.staged_scroll = 0;
+        self.split_requested = None;
         self.textarea = make_textarea("Draft", "Generating commit message options...");
 
         tokio::spawn(async move {
@@ -879,7 +930,7 @@ impl CommitView {
                     Ok(suggestions) => {
                         self.options = suggestions.options.clone();
                         self.drafts = suggestions.options;
-                        self.split_suggestions = suggestions.split;
+                        self.split_plans = suggestions.split;
                         self.list_state.select(Some(0));
                         self.load_selected_draft();
                         self.generation = GenerationState::Ready;
@@ -933,6 +984,10 @@ impl CommitView {
 
     fn take_confirmed_message(&mut self) -> Option<String> {
         self.confirmed_message.take()
+    }
+
+    fn take_split_request(&mut self) -> Option<Vec<SplitCommitPlan>> {
+        self.split_requested.take()
     }
 
     fn scroll_staged(&mut self, delta: isize) {
@@ -1280,6 +1335,7 @@ mod tests {
     use super::{
         CommitMode, CommitView, GenerationState, build_commit_status_lines, staged_files_tree_lines,
     };
+    use crate::ai::SplitCommitPlan;
     use crate::config::{CommitStyle, ResolvedConventionalPreset};
 
     fn plain_text(lines: Vec<ratatui::text::Line<'static>>) -> Vec<String> {
@@ -1342,17 +1398,25 @@ mod tests {
     #[test]
     fn shows_split_suggestions_in_commit_status() {
         let mut state = ready_commit_view();
-        state.split_suggestions = vec![
-            "feat(billing): add billing summary card".to_string(),
-            "fix(subscription): handle null subscription status".to_string(),
+        state.split_plans = vec![
+            SplitCommitPlan {
+                message: "feat(billing): add billing summary card".to_string(),
+                files: vec!["src/billing.rs".to_string()],
+            },
+            SplitCommitPlan {
+                message: "fix(subscription): handle null subscription status".to_string(),
+                files: vec!["src/subscription.rs".to_string()],
+            },
         ];
 
         let lines = plain_text(build_commit_status_lines(&state));
 
-        assert!(lines.contains(
-            &"Staged changes look mixed. Consider splitting them before committing.".to_string()
-        ));
-        assert!(lines.contains(&"Suggested split:".to_string()));
+        assert!(
+            lines.contains(
+                &"Staged changes look mixed. Press s to let gitgud split them.".to_string()
+            )
+        );
+        assert!(lines.contains(&"Split plan:".to_string()));
         assert!(lines.contains(&"  - feat(billing): add billing summary card".to_string()));
         assert!(
             lines.contains(&"  - fix(subscription): handle null subscription status".to_string())
@@ -1368,6 +1432,6 @@ mod tests {
         assert!(lines.contains(
             &"Choose an option, edit if needed, then press Enter to commit.".to_string()
         ));
-        assert!(!lines.contains(&"Suggested split:".to_string()));
+        assert!(!lines.contains(&"Split plan:".to_string()));
     }
 }

@@ -1,5 +1,6 @@
 use std::{fs, path::Path, process::Command};
 
+use gitgud::ai::SplitCommitPlan;
 use gitgud::git::{GitRepo, PushPlan};
 use tempfile::TempDir;
 
@@ -68,6 +69,93 @@ fn stages_all_changes_when_requested() {
 
     assert!(staged.staged_files.iter().any(|path| path == "README.md"));
     assert!(staged.staged_files.iter().any(|path| path == "notes.txt"));
+}
+
+#[test]
+fn split_commit_creates_one_commit_per_plan() {
+    let repo_dir = init_repo();
+    fs::create_dir_all(repo_dir.path().join("src")).unwrap();
+    fs::write(
+        repo_dir.path().join("src/billing.rs"),
+        "fn billing_summary_card() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        repo_dir.path().join("src/subscription.rs"),
+        "fn handle_subscription_status() {}\n",
+    )
+    .unwrap();
+    run(
+        repo_dir.path(),
+        &["add", "src/billing.rs", "src/subscription.rs"],
+    );
+
+    let repo = GitRepo::new(repo_dir.path());
+    repo.split_commit(&[
+        SplitCommitPlan {
+            message: "Add billing summary".into(),
+            files: vec!["src/billing.rs".into()],
+        },
+        SplitCommitPlan {
+            message: "Handle subscription status".into(),
+            files: vec!["src/subscription.rs".into()],
+        },
+    ])
+    .unwrap();
+
+    let log = run(repo_dir.path(), &["log", "--pretty=%s", "-2"]);
+    assert_eq!(
+        log.lines().collect::<Vec<_>>(),
+        vec!["Handle subscription status", "Add billing summary"]
+    );
+
+    let staged = repo.staged_changes().unwrap();
+    assert!(staged.staged_files.is_empty());
+}
+
+#[test]
+fn split_commit_rejects_plans_that_do_not_cover_all_staged_files() {
+    let repo_dir = init_repo();
+    fs::create_dir_all(repo_dir.path().join("src")).unwrap();
+    fs::write(
+        repo_dir.path().join("src/billing.rs"),
+        "fn billing_summary_card() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        repo_dir.path().join("src/subscription.rs"),
+        "fn handle_subscription_status() {}\n",
+    )
+    .unwrap();
+    run(
+        repo_dir.path(),
+        &["add", "src/billing.rs", "src/subscription.rs"],
+    );
+
+    let repo = GitRepo::new(repo_dir.path());
+    let error = repo
+        .split_commit(&[
+            SplitCommitPlan {
+                message: "Add billing summary".into(),
+                files: vec!["src/billing.rs".into()],
+            },
+            SplitCommitPlan {
+                message: "Duplicate billing summary".into(),
+                files: vec!["src/billing.rs".into()],
+            },
+        ])
+        .unwrap_err();
+
+    assert!(error.to_string().contains("more than once"));
+
+    let staged = repo.staged_changes().unwrap();
+    assert_eq!(
+        staged.staged_files,
+        vec![
+            "src/billing.rs".to_string(),
+            "src/subscription.rs".to_string()
+        ]
+    );
 }
 
 #[test]
