@@ -925,6 +925,17 @@ mod tests {
     }
 
     #[test]
+    fn rejects_split_commit_suggestions_with_invalid_count() {
+        let error = parse_commit_suggestions(
+            r#"{"options":["Update billing flow"],"split":["Add billing summary card"]}"#,
+            CommitStyle::Standard,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("between 2 and 4"));
+    }
+
+    #[test]
     fn validates_conventional_commit_subjects() {
         let message = validate_commit_message(
             "feat(cli): add multiple commit message options",
@@ -978,5 +989,37 @@ mod tests {
         assert_eq!(suggestions.split.len(), 2);
         assert!(suggestions.split[0].contains("billing"));
         assert!(suggestions.split[1].contains("subscription"));
+    }
+
+    #[test]
+    fn builds_standard_split_suggestions_for_docs_and_tests() {
+        let suggestions = build_heuristic_commit_suggestions(&super::PromptInput {
+            branch: "main".into(),
+            staged_files: vec!["README.md".into(), "tests/ai_provider.rs".into()],
+            diff_stat: "2 files changed".into(),
+            diff: "diff --git a/README.md b/README.md\n+Add split commit guidance\ndiff --git a/tests/ai_provider.rs b/tests/ai_provider.rs\n+fn covers_split_suggestions() {}\n".into(),
+            commit_style: CommitStyle::Standard,
+        });
+
+        assert_eq!(
+            suggestions.split,
+            vec![
+                "Update documentation".to_string(),
+                "Expand ai provider coverage".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn avoids_split_suggestions_for_single_concern() {
+        let suggestions = build_heuristic_commit_suggestions(&super::PromptInput {
+            branch: "feature/tui".into(),
+            staged_files: vec!["src/tui.rs".into(), "src/tui/input.rs".into()],
+            diff_stat: "2 files changed".into(),
+            diff: "diff --git a/src/tui.rs b/src/tui.rs\n+fn render_commit_view() {}\ndiff --git a/src/tui/input.rs b/src/tui/input.rs\n+fn handle_commit_input() {}\n".into(),
+            commit_style: CommitStyle::Conventional,
+        });
+
+        assert!(suggestions.split.is_empty());
     }
 }

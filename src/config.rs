@@ -436,9 +436,20 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        CommitStyle, FileConfig, Provider, ValueSource, load_file_from_path,
-        resolve_ai_settings_from, resolve_non_secret_settings_from, save_file_to_path,
+        CommitStyle, FileConfig, Provider, ValueSource, load_file_from_path, parse_commit_style,
+        parse_provider, resolve_ai_settings_from, resolve_non_secret_settings_from,
+        save_file_to_path,
     };
+
+    #[test]
+    fn reads_missing_config_file_as_default() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("missing.toml");
+
+        let loaded = load_file_from_path(&path).unwrap();
+
+        assert_eq!(loaded, FileConfig::default());
+    }
 
     #[test]
     fn resolves_from_config_file_and_keychain() {
@@ -514,6 +525,26 @@ mod tests {
     }
 
     #[test]
+    fn rejects_empty_environment_token() {
+        let error = resolve_ai_settings_from(&FileConfig::default(), Some("   "), None, None, None)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("API_TOKEN cannot be empty"));
+    }
+
+    #[test]
+    fn rejects_empty_keychain_token() {
+        let error = resolve_ai_settings_from(&FileConfig::default(), None, None, None, Some(" "))
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("stored API token cannot be empty")
+        );
+    }
+
+    #[test]
     fn reads_and_writes_config_files() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -545,5 +576,46 @@ mod tests {
         assert_eq!(resolved.provider.value, Provider::OpenAiCompatible);
         assert_eq!(resolved.base_api_url.value, "https://api.openai.com/v1");
         assert_eq!(resolved.base_model.value, "gpt-4.1-mini");
+    }
+
+    #[test]
+    fn parses_provider_aliases() {
+        assert_eq!(
+            parse_provider("openai_compatible").unwrap(),
+            Provider::OpenAiCompatible
+        );
+        assert_eq!(
+            parse_provider("OpenAICompatible").unwrap(),
+            Provider::OpenAiCompatible
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_commit_style() {
+        let error = parse_commit_style("squash").unwrap_err();
+        assert!(error.to_string().contains("commit style"));
+    }
+
+    #[test]
+    fn rejects_empty_environment_base_model() {
+        let error = resolve_non_secret_settings_from(&FileConfig::default(), None, Some("   "))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("BASE_MODEL cannot be empty"));
+    }
+
+    #[test]
+    fn rejects_empty_config_base_model() {
+        let error = resolve_non_secret_settings_from(
+            &FileConfig {
+                base_model: Some(" ".into()),
+                ..FileConfig::default()
+            },
+            None,
+            None,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("BASE_MODEL cannot be empty"));
     }
 }

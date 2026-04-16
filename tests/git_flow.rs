@@ -71,6 +71,33 @@ fn stages_all_changes_when_requested() {
 }
 
 #[test]
+fn reports_status_counts_and_tracking() {
+    let bare = TempDir::new().unwrap();
+    run(bare.path(), &["init", "--bare"]);
+    let repo_dir = init_repo();
+    run(
+        repo_dir.path(),
+        &["remote", "add", "origin", bare.path().to_str().unwrap()],
+    );
+    run(repo_dir.path(), &["push", "-u", "origin", "main"]);
+
+    fs::write(repo_dir.path().join("README.md"), "hello\nworld\n").unwrap();
+    fs::write(repo_dir.path().join("notes.txt"), "draft\n").unwrap();
+    run(repo_dir.path(), &["add", "README.md"]);
+
+    let repo = GitRepo::new(repo_dir.path());
+    let status = repo.status().unwrap();
+
+    assert_eq!(status.branch.as_deref(), Some("main"));
+    assert_eq!(status.staged_count, 1);
+    assert_eq!(status.unstaged_count, 1);
+    assert!(status.has_upstream);
+    assert_eq!(status.tracking.as_deref(), Some("origin/main"));
+    assert_eq!(status.staged_files, vec!["README.md".to_string()]);
+    assert!(status.remotes.iter().any(|remote| remote == "origin"));
+}
+
+#[test]
 fn plans_push_to_existing_upstream() {
     let bare = TempDir::new().unwrap();
     run(bare.path(), &["init", "--bare"]);

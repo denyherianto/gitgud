@@ -371,7 +371,10 @@ impl EmptyFallback for str {
 
 #[cfg(test)]
 mod tests {
-    use super::{PushPlan, parse_status_entry, push_needs_force_with_lease, resolve_push_plan};
+    use super::{
+        PushPlan, parse_status_entry, parse_tracking, push_needs_force_with_lease,
+        resolve_push_plan,
+    };
 
     #[test]
     fn prefers_existing_upstream() {
@@ -417,6 +420,12 @@ mod tests {
     }
 
     #[test]
+    fn rejects_push_without_remotes() {
+        let error = resolve_push_plan("main", false, Vec::new()).unwrap_err();
+        assert!(error.to_string().contains("no remotes found"));
+    }
+
+    #[test]
     fn parses_untracked_status_as_unstaged() {
         let entry = parse_status_entry("?? src/main.rs").unwrap();
         assert!(!entry.staged);
@@ -425,9 +434,35 @@ mod tests {
     }
 
     #[test]
+    fn parses_renamed_status_using_new_path() {
+        let entry = parse_status_entry("R  src/old.rs -> src/new.rs").unwrap();
+        assert!(entry.staged);
+        assert!(!entry.unstaged);
+        assert_eq!(entry.path, "src/new.rs");
+    }
+
+    #[test]
+    fn parses_tracking_branch_from_status_header() {
+        let tracking = parse_tracking("## main...origin/main [ahead 1]\nM  src/main.rs");
+        assert_eq!(tracking.as_deref(), Some("origin/main [ahead 1]"));
+    }
+
+    #[test]
+    fn returns_none_when_tracking_branch_is_missing() {
+        assert_eq!(parse_tracking("## main\n"), None);
+    }
+
+    #[test]
     fn detects_force_with_lease_rejection_text() {
         assert!(push_needs_force_with_lease(
             "git push failed: ! [rejected] main -> main (non-fast-forward)"
+        ));
+    }
+
+    #[test]
+    fn detects_fetch_first_force_with_lease_hint() {
+        assert!(push_needs_force_with_lease(
+            "Updates were rejected because the remote contains work that you do not have locally. Fetch first."
         ));
     }
 }
