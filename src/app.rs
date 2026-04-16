@@ -1,4 +1,4 @@
-use std::env;
+use std::{env, error::Error as StdError, ffi::OsString, fmt};
 
 use anyhow::{Result, bail};
 use clap::Parser;
@@ -33,6 +33,8 @@ pub async fn run() -> Result<()> {
     match command {
         Command::Commit => run_commit(&repo).await,
         Command::Push => run_push(&repo),
+        Command::Git { args } => run_git_passthrough(&repo, &args),
+        Command::Passthrough(args) => run_git_passthrough(&repo, &args),
         Command::Config { command } => run_config(command),
         Command::Auth { command } => run_auth(command),
         Command::Doctor => run_doctor(&repo).await,
@@ -54,6 +56,22 @@ fn resolve_home_command(repo: &GitRepo) -> Result<Option<Command>> {
 async fn run_commit(repo: &GitRepo) -> Result<()> {
     repo.ensure_git_available()?;
     repo.ensure_repo()?;
+
+    let status = repo.status()?;
+    if status.staged_count == 0 {
+        if status.unstaged_count > 0 {
+            if !tui::confirm_stage_all_changes()? {
+                println!("commit cancelled");
+                return Ok(());
+            }
+
+            repo.stage_all()?;
+        } else {
+            let message = "No staged changes found. Stage files before generating commit messages.";
+            tui::show_message("Cannot Commit", message)?;
+            bail!(message);
+        }
+    }
 
     let config = AiConfig::load()?;
     let client = AiClient::new(config.clone())?;
@@ -111,6 +129,20 @@ fn run_push(repo: &GitRepo) -> Result<()> {
             }
             Ok(())
         }
+    }
+}
+
+fn run_git_passthrough(repo: &GitRepo, args: &[OsString]) -> Result<()> {
+    repo.ensure_git_available()?;
+
+    let status = repo.run_passthrough(args)?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(GitPassthroughExit {
+            code: status.code().unwrap_or(1),
+        }
+        .into())
     }
 }
 
@@ -341,3 +373,22 @@ async fn run_doctor(repo: &GitRepo) -> Result<()> {
     println!("doctor checks passed");
     Ok(())
 }
+
+#[derive(Debug)]
+pub struct GitPassthroughExit {
+    code: i32,
+}
+
+impl GitPassthroughExit {
+    pub fn code(&self) -> i32 {
+        self.code
+    }
+}
+
+impl fmt::Display for GitPassthroughExit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "git exited with status {}", self.code)
+    }
+}
+
+impl StdError for GitPassthroughExit {}

@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     io::{self, Stdout},
     sync::mpsc::{self, Receiver, TryRecvError},
     time::Duration,
@@ -28,6 +29,7 @@ use crate::{
 
 type Backend = CrosstermBackend<Stdout>;
 type AppTerminal = Terminal<Backend>;
+const MAX_STAGED_TREE_LINES: usize = 6;
 
 pub enum HomeAction {
     Commit,
@@ -115,6 +117,10 @@ pub fn confirm_force_push(plan: &PushPlan, error_message: &str) -> Result<bool> 
     with_terminal(|terminal| force_push_loop(terminal, plan, error_message))
 }
 
+pub fn confirm_stage_all_changes() -> Result<bool> {
+    with_terminal(stage_all_changes_loop)
+}
+
 pub fn show_message(title: &str, message: &str) -> Result<()> {
     with_terminal(|terminal| {
         loop {
@@ -188,6 +194,20 @@ fn force_push_loop(
 ) -> Result<bool> {
     loop {
         terminal.draw(|frame| draw_force_push_confirm(frame, plan, error_message))?;
+
+        if let Event::Key(key) = event::read()? {
+            match key.code {
+                KeyCode::Enter => return Ok(true),
+                KeyCode::Esc => return Ok(false),
+                _ => {}
+            }
+        }
+    }
+}
+
+fn stage_all_changes_loop(terminal: &mut AppTerminal) -> Result<bool> {
+    loop {
+        terminal.draw(draw_stage_all_changes_confirm)?;
 
         if let Event::Key(key) = event::read()? {
             match key.code {
@@ -356,10 +376,12 @@ fn draw_home(frame: &mut ratatui::Frame<'_>, status: &RepoStatus) {
 }
 
 fn draw_commit(frame: &mut ratatui::Frame<'_>, state: &CommitView) {
+    let status_lines = build_commit_status_lines(state);
+    let status_height = status_lines.len() as u16 + 2;
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4),
+            Constraint::Length(status_height),
             Constraint::Min(10),
             Constraint::Length(3),
         ])
@@ -368,19 +390,19 @@ fn draw_commit(frame: &mut ratatui::Frame<'_>, state: &CommitView) {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(34), Constraint::Percentage(66)])
         .split(layout[1]);
+    let tree_lines = staged_files_tree_lines(&state.staged_files, MAX_STAGED_TREE_LINES);
+    let tree_height = tree_lines.len() as u16 + 2;
+    let sidebar = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(tree_height), Constraint::Min(6)])
+        .split(content[0]);
 
-    let status_text = match &state.generation {
-        GenerationState::Loading => "Generating 3-5 commit message options from the staged diff...",
-        GenerationState::Ready => "Choose an option, edit if needed, then press Enter to commit.",
-        GenerationState::Error(error) => error,
-    };
-    let status_block = Paragraph::new(vec![
-        Line::from(format!("Style: {}", state.commit_style)),
-        Line::from(format!("Staged files: {}", state.staged_files.join(", "))),
-        Line::from(status_text),
-    ])
-    .block(Block::default().borders(Borders::ALL).title("Commit"))
-    .wrap(Wrap { trim: false });
+    let status_block = Paragraph::new(status_lines)
+        .block(Block::default().borders(Borders::ALL).title("Commit"))
+        .wrap(Wrap { trim: false });
+    let staged_files = Paragraph::new(tree_lines.join("\n"))
+        .block(Block::default().borders(Borders::ALL).title("Staged"))
+        .wrap(Wrap { trim: false });
 
     let options = if state.options.is_empty() {
         vec![ListItem::new("(waiting for options)")]
@@ -410,7 +432,8 @@ fn draw_commit(frame: &mut ratatui::Frame<'_>, state: &CommitView) {
     let mut list_state = state.list_state.clone();
 
     frame.render_widget(status_block, layout[0]);
-    frame.render_stateful_widget(options_list, content[0], &mut list_state);
+    frame.render_widget(staged_files, sidebar[0]);
+    frame.render_stateful_widget(options_list, sidebar[1], &mut list_state);
     frame.render_widget(&state.textarea, content[1]);
     frame.render_widget(help, layout[2]);
 
@@ -418,6 +441,42 @@ fn draw_commit(frame: &mut ratatui::Frame<'_>, state: &CommitView) {
         let (x, y) = state.textarea.cursor();
         frame.set_cursor_position((x as u16, y as u16));
     }
+}
+
+fn build_commit_status_lines(state: &CommitView) -> Vec<Line<'static>> {
+    let status_text = match &state.generation {
+        GenerationState::Loading => "Generating 1-3 commit message options from the staged diff...",
+        GenerationState::Ready => "Choose an option, edit if needed, then press Enter to commit.",
+        GenerationState::Error(error) => error.as_str(),
+    };
+
+    vec![
+        Line::from(format!("Style: {}", state.commit_style)),
+        Line::from(format!("Staged count: {}", state.staged_files.len())),
+        Line::from(status_text.to_string()),
+    ]
+}
+
+fn staged_files_tree_lines(staged_files: &[String], max_lines: usize) -> Vec<String> {
+    if staged_files.is_empty() {
+        return vec!["(none)".to_string()];
+    }
+
+    let mut root = FileTreeNode::default();
+    for path in staged_files {
+        root.insert(path);
+    }
+
+    let mut lines = Vec::new();
+    root.render(String::new(), &mut lines);
+
+    if lines.len() > max_lines {
+        let hidden = lines.len() - max_lines;
+        lines.truncate(max_lines);
+        lines.push(format!("... and {hidden} more"));
+    }
+
+    lines
 }
 
 fn draw_config_setup(frame: &mut ratatui::Frame<'_>, state: &ConfigSetupView) {
@@ -495,6 +554,14 @@ fn draw_force_push_confirm(frame: &mut ratatui::Frame<'_>, plan: &PushPlan, erro
     };
 
     draw_message(frame, "Force Push Confirmation", &message);
+}
+
+fn draw_stage_all_changes_confirm(frame: &mut ratatui::Frame<'_>) {
+    draw_message(
+        frame,
+        "Stage All Changes",
+        "No staged changes found.\n\nPress Enter to stage all tracked and untracked changes with git add --all, or Esc to cancel.",
+    );
 }
 
 fn draw_message(frame: &mut ratatui::Frame<'_>, title: &str, message: &str) {
@@ -1040,4 +1107,74 @@ fn make_textarea_with_content(title: &'static str, content: &str) -> TextArea<'s
     textarea.set_line_number_style(Style::default().fg(Color::DarkGray));
     textarea.set_cursor_line_style(Style::default());
     textarea
+}
+
+#[derive(Debug, Default)]
+struct FileTreeNode {
+    children: BTreeMap<String, FileTreeNode>,
+}
+
+impl FileTreeNode {
+    fn insert(&mut self, path: &str) {
+        let mut node = self;
+        for segment in path.split('/').filter(|segment| !segment.is_empty()) {
+            node = node.children.entry(segment.to_string()).or_default();
+        }
+    }
+
+    fn render(&self, prefix: String, lines: &mut Vec<String>) {
+        let len = self.children.len();
+        for (index, (name, child)) in self.children.iter().enumerate() {
+            let is_last = index + 1 == len;
+            let connector = if is_last { "`-- " } else { "|-- " };
+            lines.push(format!("{prefix}{connector}{name}"));
+
+            let child_prefix = format!("{prefix}{}", if is_last { "    " } else { "|   " });
+            child.render(child_prefix, lines);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::staged_files_tree_lines;
+
+    #[test]
+    fn renders_staged_files_as_tree() {
+        let lines = staged_files_tree_lines(
+            &[
+                "src/tui.rs".to_string(),
+                "src/app.rs".to_string(),
+                "tests/git_flow.rs".to_string(),
+            ],
+            10,
+        );
+
+        assert_eq!(
+            lines,
+            vec![
+                "|-- src".to_string(),
+                "|   |-- app.rs".to_string(),
+                "|   `-- tui.rs".to_string(),
+                "`-- tests".to_string(),
+                "    `-- git_flow.rs".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn truncates_long_staged_file_tree() {
+        let lines = staged_files_tree_lines(
+            &[
+                "a.rs".to_string(),
+                "b.rs".to_string(),
+                "c.rs".to_string(),
+                "d.rs".to_string(),
+            ],
+            2,
+        );
+
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[2], "... and 2 more");
+    }
 }

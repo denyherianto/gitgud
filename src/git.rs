@@ -1,6 +1,7 @@
 use std::{
+    ffi::OsString,
     path::{Path, PathBuf},
-    process::{Command, Output, Stdio},
+    process::{Command, ExitStatus, Output, Stdio},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -168,6 +169,21 @@ impl GitRepo {
         stringify_output(output, "git commit")
     }
 
+    pub fn stage_all(&self) -> Result<String> {
+        self.run_checked(["add", "--all"])
+    }
+
+    pub fn run_passthrough(&self, args: &[OsString]) -> Result<ExitStatus> {
+        Command::new("git")
+            .current_dir(&self.cwd)
+            .args(args)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .with_context(|| format!("failed to execute {}", format_git_command(args)))
+    }
+
     pub fn push(&self, plan: &PushPlan) -> Result<String> {
         self.push_with_options(plan, false)
     }
@@ -229,6 +245,20 @@ impl GitRepo {
             .args(args)
             .output()
             .with_context(|| format!("failed to execute git {}", args.join(" ")))
+    }
+}
+
+fn format_git_command(args: &[OsString]) -> String {
+    let rendered = args
+        .iter()
+        .map(|arg| arg.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    if rendered.is_empty() {
+        "git".to_string()
+    } else {
+        format!("git {rendered}")
     }
 }
 

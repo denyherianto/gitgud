@@ -3,18 +3,19 @@
 `gitgud` is a Rust CLI that adds a terminal UI and AI-assisted workflows on top of normal Git commands.
 
 <p align="center">
-  <img src="./assets/gitgud-repo-illustration.svg" alt="gitgud mascot icon" width="220">
+  <img src="./assets/gitgud-mascot.jpg" alt="gitgud repo mascot" width="280">
 </p>
 
 ## Features
 
-- Generate 3-5 commit message options from the staged diff
+- Generate 1-3 commit message options from the staged diff
 - Choose an option in the TUI and edit it inline before committing
 - Support standard and Conventional Commits styles
 - Push the current branch to its upstream automatically
 - Offer `--force-with-lease` only after explicit confirmation
 - Configure provider, endpoint, model, token, and commit style in one setup screen
 - Use Gemini by default, or any OpenAI-compatible provider
+- Pass through normal Git commands like `status`, `log`, `diff`, and `branch`
 - Validate local setup with a `doctor` command
 
 ## Requirements
@@ -66,6 +67,9 @@ cargo run --bin gg -- auth status
 cargo run --bin gg -- doctor
 cargo run --bin gg -- commit
 cargo run --bin gg -- push
+cargo run --bin gg -- status --short
+cargo run --bin gg -- log --oneline -5
+cargo run --bin gg -- git commit --amend
 ```
 
 After building:
@@ -115,11 +119,29 @@ Keys:
 - `p` push current branch
 - `q` quit
 
+### Other Git Commands
+
+Unknown commands are passed straight through to Git:
+
+```bash
+gg status
+gg diff --cached
+gg log --oneline -10
+gg branch
+```
+
+To force raw Git for a built-in name that `gg` already uses, call `git` explicitly:
+
+```bash
+gg git commit --amend
+gg git push --force-with-lease
+```
+
 ### `gg commit`
 
 - requires staged changes
 - reads the staged diff
-- asks the configured AI provider for 3-5 commit message options
+- asks the configured AI provider for 1-3 commit message options
 - lets you choose one option in the TUI
 - supports inline editing before commit
 - respects the configured commit style, including Conventional Commits mode

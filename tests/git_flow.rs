@@ -57,6 +57,20 @@ fn reports_no_staged_changes() {
 }
 
 #[test]
+fn stages_all_changes_when_requested() {
+    let repo_dir = init_repo();
+    fs::write(repo_dir.path().join("README.md"), "hello\nworld\n").unwrap();
+    fs::write(repo_dir.path().join("notes.txt"), "draft\n").unwrap();
+
+    let repo = GitRepo::new(repo_dir.path());
+    repo.stage_all().unwrap();
+    let staged = repo.staged_changes().unwrap();
+
+    assert!(staged.staged_files.iter().any(|path| path == "README.md"));
+    assert!(staged.staged_files.iter().any(|path| path == "notes.txt"));
+}
+
+#[test]
 fn plans_push_to_existing_upstream() {
     let bare = TempDir::new().unwrap();
     run(bare.path(), &["init", "--bare"]);

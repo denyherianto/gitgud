@@ -1,3 +1,5 @@
+use std::ffi::OsString;
+
 use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::config::{CommitStyle, Provider};
@@ -14,10 +16,15 @@ pub struct Cli {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum Command {
-    /// Generate 3-5 commit message options for staged changes
+    /// Generate 1-3 commit message options for staged changes
     Commit,
     /// Push the current branch automatically and confirm force-with-lease only when needed
     Push,
+    /// Run a raw git command, including built-in names like `commit` or `push`
+    Git {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<OsString>,
+    },
     /// Open setup or manage persistent configuration
     Config {
         #[command(subcommand)]
@@ -30,6 +37,8 @@ pub enum Command {
     },
     /// Validate git and AI provider configuration
     Doctor,
+    #[command(external_subcommand)]
+    Passthrough(Vec<OsString>),
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -91,6 +100,41 @@ impl From<CommitStyleArg> for CommitStyle {
         match value {
             CommitStyleArg::Standard => CommitStyle::Standard,
             CommitStyleArg::Conventional => CommitStyle::Conventional,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::{Cli, Command};
+
+    #[test]
+    fn parses_unknown_subcommand_as_git_passthrough() {
+        let cli = Cli::try_parse_from(["gg", "status", "--short"]).unwrap();
+
+        match cli.command {
+            Some(Command::Passthrough(args)) => {
+                assert_eq!(args.len(), 2);
+                assert_eq!(args[0].to_string_lossy(), "status");
+                assert_eq!(args[1].to_string_lossy(), "--short");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_explicit_git_passthrough() {
+        let cli = Cli::try_parse_from(["gg", "git", "commit", "--amend"]).unwrap();
+
+        match cli.command {
+            Some(Command::Git { args }) => {
+                assert_eq!(args.len(), 2);
+                assert_eq!(args[0].to_string_lossy(), "commit");
+                assert_eq!(args[1].to_string_lossy(), "--amend");
+            }
+            other => panic!("unexpected command: {other:?}"),
         }
     }
 }

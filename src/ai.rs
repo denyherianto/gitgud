@@ -111,6 +111,17 @@ impl AiClient {
     }
 
     pub async fn generate_commit_options(&self, input: &PromptInput) -> Result<Vec<String>> {
+        match self.generate_commit_options_from_provider(input).await {
+            Ok(options) => Ok(options),
+            Err(error) if is_timeout_error(&error) => Ok(build_heuristic_commit_options(input)),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn generate_commit_options_from_provider(
+        &self,
+        input: &PromptInput,
+    ) -> Result<Vec<String>> {
         let endpoint = format!("{}/chat/completions", self.config.base_api_url);
         let request = ChatCompletionRequest {
             model: self.config.base_model.clone(),
@@ -248,6 +259,30 @@ pub fn validate_commit_message(raw: &str, commit_style: CommitStyle) -> Result<S
     Ok(message)
 }
 
+pub fn build_heuristic_commit_options(input: &PromptInput) -> Vec<String> {
+    let subject = describe_change_subject(&input.staged_files);
+    let standard = [
+        format!("Update {subject}"),
+        format!("Refine {subject} handling"),
+        format!("Adjust {subject} flow"),
+    ];
+
+    let conventional_type = infer_conventional_type(input);
+    let conventional_scope = infer_conventional_scope(&input.staged_files);
+    let conventional = [
+        format!("{conventional_type}({conventional_scope}): update {subject}"),
+        format!("{conventional_type}({conventional_scope}): refine {subject} handling"),
+        format!("{conventional_type}({conventional_scope}): adjust {subject} flow"),
+    ];
+
+    let candidates = match input.commit_style {
+        CommitStyle::Standard => standard,
+        CommitStyle::Conventional => conventional,
+    };
+
+    candidates.into_iter().map(limit_subject_to_72).collect()
+}
+
 fn build_system_prompt(commit_style: CommitStyle) -> String {
     let style_rules = match commit_style {
         CommitStyle::Standard => {
@@ -259,14 +294,14 @@ fn build_system_prompt(commit_style: CommitStyle) -> String {
     };
 
     format!(
-        "You write concise Git commit messages. Return valid JSON only with this shape: {{\"options\":[\"message 1\",\"message 2\",\"message 3\"]}}. Provide 3 to 5 distinct options. Each option may include a blank line and body, but no markdown fences, labels, numbering, or commentary. Describe only the staged changes. {style_rules}"
+        "You write concise Git commit messages. Return valid JSON only with this shape: {{\"options\":[\"message 1\",\"message 2\",\"message 3\"]}}. Provide 1 to 3 distinct options. Each option may include a blank line and body, but no markdown fences, labels, numbering, or commentary. Describe only the staged changes. {style_rules}"
     )
 }
 
 fn parse_commit_options(raw: &str, commit_style: CommitStyle) -> Result<Vec<String>> {
     let parsed = parse_options_payload(raw)?;
-    if !(3..=5).contains(&parsed.options.len()) {
-        bail!("AI provider must return between 3 and 5 commit message options");
+    if !(1..=3).contains(&parsed.options.len()) {
+        bail!("AI provider must return between 1 and 3 commit message options");
     }
 
     let mut options = Vec::with_capacity(parsed.options.len());
@@ -341,6 +376,167 @@ fn validate_conventional_subject(subject: &str) -> Result<()> {
     Ok(())
 }
 
+fn is_timeout_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(reqwest::Error::is_timeout)
+    })
+}
+
+fn describe_change_subject(staged_files: &[String]) -> String {
+    if staged_files
+        .iter()
+        .any(|path| path == ".github/workflows/release.yml")
+    {
+        return "release workflow".to_string();
+    }
+
+    if staged_files
+        .iter()
+        .all(|path| path == "README.md" || path.starts_with("docs/"))
+    {
+        return "documentation".to_string();
+    }
+
+    if staged_files.iter().all(|path| path.starts_with("tests/")) {
+        return "test coverage".to_string();
+    }
+
+    if staged_files.iter().any(|path| path == "install.sh") {
+        return "installer".to_string();
+    }
+
+    if let Some(module) = staged_files
+        .iter()
+        .filter_map(|path| path.strip_prefix("src/"))
+        .filter_map(|path| path.strip_suffix(".rs"))
+        .next()
+    {
+        return humanize_identifier(module);
+    }
+
+    if staged_files.len() == 1 {
+        return staged_files
+            .first()
+            .map(|path| {
+                path.rsplit('/')
+                    .next()
+                    .and_then(|file| file.split('.').next())
+                    .map(humanize_identifier)
+                    .unwrap_or_else(|| "project".to_string())
+            })
+            .unwrap_or_else(|| "project".to_string());
+    }
+
+    staged_files
+        .iter()
+        .filter_map(|path| path.split('/').next())
+        .find(|segment| !segment.is_empty() && *segment != ".")
+        .map(humanize_identifier)
+        .unwrap_or_else(|| "project".to_string())
+}
+
+fn infer_conventional_type(input: &PromptInput) -> &'static str {
+    let branch = input.branch.to_ascii_lowercase();
+
+    if input
+        .staged_files
+        .iter()
+        .any(|path| path.starts_with(".github/"))
+    {
+        "ci"
+    } else if input
+        .staged_files
+        .iter()
+        .all(|path| path == "README.md" || path.starts_with("docs/"))
+    {
+        "docs"
+    } else if input
+        .staged_files
+        .iter()
+        .all(|path| path.starts_with("tests/"))
+    {
+        "test"
+    } else if branch.starts_with("fix/")
+        || branch.starts_with("bugfix/")
+        || branch.starts_with("hotfix/")
+    {
+        "fix"
+    } else if branch.starts_with("feat/") || branch.starts_with("feature/") {
+        "feat"
+    } else {
+        "chore"
+    }
+}
+
+fn infer_conventional_scope(staged_files: &[String]) -> String {
+    if staged_files
+        .iter()
+        .any(|path| path.starts_with(".github/workflows/"))
+    {
+        return "release".to_string();
+    }
+
+    if staged_files.iter().all(|path| path.starts_with("tests/")) {
+        return "tests".to_string();
+    }
+
+    if staged_files
+        .iter()
+        .all(|path| path == "README.md" || path.starts_with("docs/"))
+    {
+        return "docs".to_string();
+    }
+
+    if let Some(module) = staged_files
+        .iter()
+        .filter_map(|path| path.strip_prefix("src/"))
+        .filter_map(|path| path.strip_suffix(".rs"))
+        .next()
+    {
+        let scope = sanitize_scope(module);
+        if !scope.is_empty() {
+            return scope;
+        }
+    }
+
+    if staged_files.iter().any(|path| path == "install.sh") {
+        return "install".to_string();
+    }
+
+    "project".to_string()
+}
+
+fn humanize_identifier(raw: &str) -> String {
+    raw.split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+fn sanitize_scope(raw: &str) -> String {
+    raw.chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-' || *ch == '/' || *ch == '_')
+        .collect::<String>()
+        .to_ascii_lowercase()
+}
+
+fn limit_subject_to_72(subject: String) -> String {
+    let count = subject.chars().count();
+    if count <= 72 {
+        return subject;
+    }
+
+    subject
+        .chars()
+        .take(72)
+        .collect::<String>()
+        .trim_end()
+        .to_string()
+}
+
 #[derive(Debug, Serialize)]
 struct ChatCompletionRequest {
     model: String,
@@ -379,8 +575,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        AiConfig, DEFAULT_BASE_API_URL, build_commit_prompt, normalize_base_api_url,
-        parse_commit_options, truncate_diff, validate_commit_message,
+        AiConfig, DEFAULT_BASE_API_URL, build_commit_prompt, build_heuristic_commit_options,
+        normalize_base_api_url, parse_commit_options, truncate_diff, validate_commit_message,
     };
     use crate::config::{CommitStyle, Provider};
 
@@ -476,5 +672,35 @@ mod tests {
         .unwrap();
 
         assert_eq!(message, "feat(cli): add multiple commit message options");
+    }
+
+    #[test]
+    fn builds_standard_heuristic_commit_options() {
+        let options = build_heuristic_commit_options(&super::PromptInput {
+            branch: "main".into(),
+            staged_files: vec![".github/workflows/release.yml".into()],
+            diff_stat: "1 file changed".into(),
+            diff: "diff --git".into(),
+            commit_style: CommitStyle::Standard,
+        });
+
+        assert_eq!(options[0], "Update release workflow");
+        assert_eq!(options.len(), 3);
+    }
+
+    #[test]
+    fn builds_conventional_heuristic_commit_options() {
+        let options = build_heuristic_commit_options(&super::PromptInput {
+            branch: "feature/release".into(),
+            staged_files: vec!["src/tui.rs".into()],
+            diff_stat: "1 file changed".into(),
+            diff: "diff --git".into(),
+            commit_style: CommitStyle::Conventional,
+        });
+
+        assert!(options[0].starts_with("feat(tui): "));
+        for option in options {
+            validate_commit_message(&option, CommitStyle::Conventional).unwrap();
+        }
     }
 }
