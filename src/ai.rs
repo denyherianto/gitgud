@@ -4,7 +4,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{CommitStyle, Provider, resolve_ai_settings};
+use crate::config::{CommitStyle, Provider, ResolvedConventionalPreset, resolve_ai_settings};
 
 pub const DEFAULT_PROVIDER: Provider = Provider::Gemini;
 pub const DEFAULT_BASE_API_URL: &str = "https://generativelanguage.googleapis.com/v1beta/openai";
@@ -20,6 +20,7 @@ pub struct AiConfig {
     pub base_api_url: String,
     pub base_model: String,
     pub commit_style: CommitStyle,
+    pub conventional_preset: ResolvedConventionalPreset,
     pub timeout: Duration,
 }
 
@@ -32,6 +33,7 @@ impl AiConfig {
             &resolved.base_api_url.value,
             &resolved.base_model.value,
             resolved.commit_style.value,
+            resolved.conventional_preset.value,
         )
     }
 
@@ -41,6 +43,7 @@ impl AiConfig {
         base_api_url: &str,
         base_model: &str,
         commit_style: CommitStyle,
+        conventional_preset: ResolvedConventionalPreset,
     ) -> Result<Self> {
         if api_token.trim().is_empty() {
             bail!("API_TOKEN cannot be empty");
@@ -56,6 +59,7 @@ impl AiConfig {
             base_api_url: normalize_base_api_url(base_api_url)?,
             base_model: base_model.trim().to_string(),
             commit_style,
+            conventional_preset,
             timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
         })
     }
@@ -73,6 +77,7 @@ pub struct PromptInput {
     pub diff_stat: String,
     pub diff: String,
     pub commit_style: CommitStyle,
+    pub conventional_preset: ResolvedConventionalPreset,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,7 +149,7 @@ impl AiClient {
             messages: vec![
                 ChatMessage {
                     role: "system".to_string(),
-                    content: build_system_prompt(input.commit_style),
+                    content: build_system_prompt(input.commit_style, &input.conventional_preset),
                 },
                 ChatMessage {
                     role: "user".to_string(),
@@ -181,7 +186,11 @@ impl AiClient {
             .map(|choice| choice.message.content)
             .ok_or_else(|| anyhow!("AI provider returned no choices"))?;
 
-        parse_commit_suggestions(&content, input.commit_style)
+        parse_commit_suggestions_with_preset(
+            &content,
+            input.commit_style,
+            &input.conventional_preset,
+        )
     }
 }
 
@@ -206,9 +215,18 @@ pub fn build_commit_prompt(input: &PromptInput) -> String {
         CommitStyle::Standard => "standard",
         CommitStyle::Conventional => "conventional",
     };
+    let conventional_context = if matches!(input.commit_style, CommitStyle::Conventional) {
+        format!(
+            "\nConventional preset: {}\nAllowed types: {}",
+            input.conventional_preset.name,
+            input.conventional_preset.types.join(", ")
+        )
+    } else {
+        String::new()
+    };
 
     format!(
-        "Commit style: {style}\nBranch: {}\nStaged files: {}\nDiff summary:\n{}\n\nStaged patch:\n{}",
+        "Commit style: {style}{conventional_context}\nBranch: {}\nStaged files: {}\nDiff summary:\n{}\n\nStaged patch:\n{}",
         input.branch,
         file_list,
         if input.diff_stat.trim().is_empty() {
@@ -230,6 +248,18 @@ pub fn truncate_diff(diff: &str, max_chars: usize) -> String {
 }
 
 pub fn validate_commit_message(raw: &str, commit_style: CommitStyle) -> Result<String> {
+    validate_commit_message_with_preset(
+        raw,
+        commit_style,
+        &ResolvedConventionalPreset::built_in_default(),
+    )
+}
+
+pub fn validate_commit_message_with_preset(
+    raw: &str,
+    commit_style: CommitStyle,
+    conventional_preset: &ResolvedConventionalPreset,
+) -> Result<String> {
     let normalized = raw.replace("\r\n", "\n");
     let lines: Vec<String> = normalized
         .lines()
@@ -256,7 +286,7 @@ pub fn validate_commit_message(raw: &str, commit_style: CommitStyle) -> Result<S
     }
 
     if matches!(commit_style, CommitStyle::Conventional) {
-        validate_conventional_subject(subject)?;
+        validate_conventional_subject(subject, &conventional_preset.types)?;
     }
 
     let body_lines = lines[1..]
@@ -305,14 +335,20 @@ pub fn build_heuristic_commit_options(input: &PromptInput) -> Vec<String> {
     build_heuristic_commit_suggestions(input).options
 }
 
-fn build_system_prompt(commit_style: CommitStyle) -> String {
+fn build_system_prompt(
+    commit_style: CommitStyle,
+    conventional_preset: &ResolvedConventionalPreset,
+) -> String {
     let style_rules = match commit_style {
         CommitStyle::Standard => {
             "Use standard commit messages with an imperative subject under 72 characters."
+                .to_string()
         }
-        CommitStyle::Conventional => {
-            "Use Conventional Commits. Every subject must match type(scope optional)!: description."
-        }
+        CommitStyle::Conventional => format!(
+            "Use Conventional Commits. Every subject must match type(scope optional)!: description. Only use these commit types from the '{}' preset: {}.",
+            conventional_preset.name,
+            conventional_preset.types.join(", ")
+        ),
     };
 
     format!(
@@ -320,7 +356,20 @@ fn build_system_prompt(commit_style: CommitStyle) -> String {
     )
 }
 
+#[cfg(test)]
 fn parse_commit_suggestions(raw: &str, commit_style: CommitStyle) -> Result<CommitSuggestions> {
+    parse_commit_suggestions_with_preset(
+        raw,
+        commit_style,
+        &ResolvedConventionalPreset::built_in_default(),
+    )
+}
+
+fn parse_commit_suggestions_with_preset(
+    raw: &str,
+    commit_style: CommitStyle,
+    conventional_preset: &ResolvedConventionalPreset,
+) -> Result<CommitSuggestions> {
     let parsed = parse_options_payload(raw)?;
     if !(1..=3).contains(&parsed.options.len()) {
         bail!("AI provider must return between 1 and 3 commit message options");
@@ -328,12 +377,20 @@ fn parse_commit_suggestions(raw: &str, commit_style: CommitStyle) -> Result<Comm
 
     let mut options = Vec::with_capacity(parsed.options.len());
     for option in parsed.options {
-        options.push(validate_commit_message(&option, commit_style)?);
+        options.push(validate_commit_message_with_preset(
+            &option,
+            commit_style,
+            conventional_preset,
+        )?);
     }
 
     let mut split = Vec::with_capacity(parsed.split.len());
     for message in parsed.split {
-        split.push(validate_commit_message(&message, commit_style)?);
+        split.push(validate_commit_message_with_preset(
+            &message,
+            commit_style,
+            conventional_preset,
+        )?);
     }
 
     if !split.is_empty() && !(2..=4).contains(&split.len()) {
@@ -345,7 +402,12 @@ fn parse_commit_suggestions(raw: &str, commit_style: CommitStyle) -> Result<Comm
 
 #[cfg(test)]
 fn parse_commit_options(raw: &str, commit_style: CommitStyle) -> Result<Vec<String>> {
-    parse_commit_suggestions(raw, commit_style).map(|parsed| parsed.options)
+    parse_commit_suggestions_with_preset(
+        raw,
+        commit_style,
+        &ResolvedConventionalPreset::built_in_default(),
+    )
+    .map(|parsed| parsed.options)
 }
 
 fn parse_options_payload(raw: &str) -> Result<CommitOptionsPayload> {
@@ -373,7 +435,7 @@ fn strip_code_fence(raw: &str) -> Option<&str> {
     stripped.strip_suffix("```").map(str::trim)
 }
 
-fn validate_conventional_subject(subject: &str) -> Result<()> {
+fn validate_conventional_subject(subject: &str, allowed_types: &[String]) -> Result<()> {
     let (head, description) = subject
         .split_once(": ")
         .ok_or_else(|| anyhow!("conventional commit subject must contain ': '"))?;
@@ -397,6 +459,13 @@ fn validate_conventional_subject(subject: &str) -> Result<()> {
             .all(|ch| ch.is_ascii_lowercase() || ch == '-')
     {
         bail!("conventional commit type must use lowercase ASCII letters or hyphens");
+    }
+
+    if !allowed_types.iter().any(|allowed| allowed == commit_type) {
+        bail!(
+            "conventional commit type must be one of: {}",
+            allowed_types.join(", ")
+        );
     }
 
     if let Some(scope) = scope {
@@ -429,11 +498,21 @@ fn build_heuristic_split_suggestions(input: &PromptInput) -> Vec<String> {
     concerns
         .into_iter()
         .take(4)
-        .map(|concern| limit_subject_to_72(build_split_message(&concern, input.commit_style)))
+        .map(|concern| {
+            limit_subject_to_72(build_split_message(
+                &concern,
+                input.commit_style,
+                &input.conventional_preset.types,
+            ))
+        })
         .collect()
 }
 
-fn build_split_message(concern: &Concern, commit_style: CommitStyle) -> String {
+fn build_split_message(
+    concern: &Concern,
+    commit_style: CommitStyle,
+    conventional_types: &[String],
+) -> String {
     let is_fix = concern.diff_mentions_fix || concern.label.contains("fix");
     let is_feature = concern.diff_mentions_feature;
 
@@ -454,14 +533,17 @@ fn build_split_message(concern: &Concern, commit_style: CommitStyle) -> String {
             }
         }
         CommitStyle::Conventional => {
-            let commit_type = match concern.kind {
-                ConcernKind::Docs => "docs",
-                ConcernKind::Tests => "test",
-                ConcernKind::Ci => "ci",
-                ConcernKind::Install | ConcernKind::Other => "chore",
-                ConcernKind::Source if is_fix => "fix",
-                ConcernKind::Source => "feat",
+            let preferred_types: &[&str] = match concern.kind {
+                ConcernKind::Docs => &["docs", "chore"],
+                ConcernKind::Tests => &["test", "chore"],
+                ConcernKind::Ci => &["ci", "build", "chore"],
+                ConcernKind::Install => &["build", "chore"],
+                ConcernKind::Other => &["chore", "build"],
+                ConcernKind::Source if is_fix => &["fix", "refactor", "chore"],
+                ConcernKind::Source if is_feature => &["feat", "refactor", "chore"],
+                ConcernKind::Source => &["feat", "refactor", "chore"],
             };
+            let commit_type = pick_conventional_type(conventional_types, preferred_types);
             let scope = sanitize_scope(&concern.scope);
             let description = match concern.kind {
                 ConcernKind::Docs => format!("update {}", concern.label),
@@ -652,37 +734,78 @@ fn describe_change_subject(staged_files: &[String]) -> String {
         .unwrap_or_else(|| "project".to_string())
 }
 
-fn infer_conventional_type(input: &PromptInput) -> &'static str {
+fn infer_conventional_type(input: &PromptInput) -> String {
     let branch = input.branch.to_ascii_lowercase();
-
-    if input
+    let diff = input.diff.to_ascii_lowercase();
+    let preferred: &[&str] = if input
         .staged_files
         .iter()
         .any(|path| path.starts_with(".github/"))
     {
-        "ci"
+        &["ci", "build", "chore"]
     } else if input
         .staged_files
         .iter()
         .all(|path| path == "README.md" || path.starts_with("docs/"))
     {
-        "docs"
+        &["docs", "chore"]
     } else if input
         .staged_files
         .iter()
         .all(|path| path.starts_with("tests/"))
     {
-        "test"
+        &["test", "chore"]
+    } else if input
+        .staged_files
+        .iter()
+        .any(|path| path == "install.sh" || path == "Cargo.toml" || path == "Cargo.lock")
+    {
+        &["build", "chore", "ci"]
+    } else if contains_any(
+        &diff,
+        &[
+            "perf",
+            "optimiz",
+            "faster",
+            "latency",
+            "cache",
+            "throughput",
+        ],
+    ) {
+        &["perf", "refactor", "feat", "chore"]
+    } else if contains_any(
+        &diff,
+        &["refactor", "rename", "extract", "cleanup", "restructure"],
+    ) {
+        &["refactor", "feat", "chore"]
     } else if branch.starts_with("fix/")
         || branch.starts_with("bugfix/")
         || branch.starts_with("hotfix/")
     {
-        "fix"
+        &["fix", "refactor", "chore"]
     } else if branch.starts_with("feat/") || branch.starts_with("feature/") {
-        "feat"
+        &["feat", "refactor", "chore"]
     } else {
-        "chore"
+        &["chore", "feat", "refactor", "fix"]
+    };
+
+    pick_conventional_type(&input.conventional_preset.types, preferred)
+}
+
+fn pick_conventional_type(conventional_types: &[String], preferred: &[&str]) -> String {
+    for commit_type in preferred {
+        if conventional_types
+            .iter()
+            .any(|allowed| allowed == commit_type)
+        {
+            return (*commit_type).to_string();
+        }
     }
+
+    conventional_types
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "chore".to_string())
 }
 
 fn infer_conventional_scope(staged_files: &[String]) -> String {
@@ -826,8 +949,13 @@ mod tests {
         AiConfig, DEFAULT_BASE_API_URL, build_commit_prompt, build_heuristic_commit_options,
         build_heuristic_commit_suggestions, normalize_base_api_url, parse_commit_options,
         parse_commit_suggestions, truncate_diff, validate_commit_message,
+        validate_commit_message_with_preset,
     };
-    use crate::config::{CommitStyle, Provider};
+    use crate::config::{CommitStyle, Provider, ResolvedConventionalPreset};
+
+    fn default_preset() -> ResolvedConventionalPreset {
+        ResolvedConventionalPreset::built_in_default()
+    }
 
     #[test]
     fn normalizes_base_url() {
@@ -843,6 +971,7 @@ mod tests {
             DEFAULT_BASE_API_URL,
             "   ",
             CommitStyle::Standard,
+            default_preset(),
         )
         .unwrap_err();
         assert!(error.to_string().contains("BASE_MODEL"));
@@ -879,12 +1008,28 @@ mod tests {
             diff_stat: "1 file changed".into(),
             diff: "diff --git".into(),
             commit_style: CommitStyle::Standard,
+            conventional_preset: default_preset(),
         });
 
         assert!(prompt.contains("Branch: main"));
         assert!(prompt.contains("Commit style: standard"));
         assert!(prompt.contains("src/main.rs"));
         assert!(prompt.contains("1 file changed"));
+    }
+
+    #[test]
+    fn includes_conventional_preset_in_prompt() {
+        let prompt = build_commit_prompt(&super::PromptInput {
+            branch: "main".into(),
+            staged_files: vec!["src/main.rs".into()],
+            diff_stat: "1 file changed".into(),
+            diff: "diff --git".into(),
+            commit_style: CommitStyle::Conventional,
+            conventional_preset: default_preset(),
+        });
+
+        assert!(prompt.contains("Conventional preset: default"));
+        assert!(prompt.contains("Allowed types: feat, fix"));
     }
 
     #[test]
@@ -895,6 +1040,7 @@ mod tests {
             DEFAULT_BASE_API_URL,
             "model",
             CommitStyle::Standard,
+            default_preset(),
         )
         .unwrap()
         .with_timeout(Duration::from_secs(1));
@@ -947,6 +1093,22 @@ mod tests {
     }
 
     #[test]
+    fn rejects_conventional_types_outside_active_preset() {
+        let preset = ResolvedConventionalPreset {
+            name: "team".into(),
+            types: vec!["feature".into(), "bugfix".into()],
+        };
+        let error = validate_commit_message_with_preset(
+            "feat(cli): add commit message options",
+            CommitStyle::Conventional,
+            &preset,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("feature, bugfix"));
+    }
+
+    #[test]
     fn builds_standard_heuristic_commit_options() {
         let options = build_heuristic_commit_options(&super::PromptInput {
             branch: "main".into(),
@@ -954,6 +1116,7 @@ mod tests {
             diff_stat: "1 file changed".into(),
             diff: "diff --git".into(),
             commit_style: CommitStyle::Standard,
+            conventional_preset: default_preset(),
         });
 
         assert_eq!(options[0], "Update release workflow");
@@ -968,6 +1131,7 @@ mod tests {
             diff_stat: "1 file changed".into(),
             diff: "diff --git".into(),
             commit_style: CommitStyle::Conventional,
+            conventional_preset: default_preset(),
         });
 
         assert!(options[0].starts_with("feat(tui): "));
@@ -984,6 +1148,7 @@ mod tests {
             diff_stat: "2 files changed".into(),
             diff: "diff --git a/src/billing.rs b/src/billing.rs\n+fn billing_summary_card() {}\ndiff --git a/src/subscription.rs b/src/subscription.rs\n+if status == null {\n+    return;\n+}\n".into(),
             commit_style: CommitStyle::Conventional,
+            conventional_preset: default_preset(),
         });
 
         assert_eq!(suggestions.split.len(), 2);
@@ -999,6 +1164,7 @@ mod tests {
             diff_stat: "2 files changed".into(),
             diff: "diff --git a/README.md b/README.md\n+Add split commit guidance\ndiff --git a/tests/ai_provider.rs b/tests/ai_provider.rs\n+fn covers_split_suggestions() {}\n".into(),
             commit_style: CommitStyle::Standard,
+            conventional_preset: default_preset(),
         });
 
         assert_eq!(
@@ -1018,8 +1184,26 @@ mod tests {
             diff_stat: "2 files changed".into(),
             diff: "diff --git a/src/tui.rs b/src/tui.rs\n+fn render_commit_view() {}\ndiff --git a/src/tui/input.rs b/src/tui/input.rs\n+fn handle_commit_input() {}\n".into(),
             commit_style: CommitStyle::Conventional,
+            conventional_preset: default_preset(),
         });
 
         assert!(suggestions.split.is_empty());
+    }
+
+    #[test]
+    fn heuristic_conventional_types_follow_custom_preset() {
+        let suggestions = build_heuristic_commit_suggestions(&super::PromptInput {
+            branch: "fix/parser".into(),
+            staged_files: vec!["src/parser.rs".into()],
+            diff_stat: "1 file changed".into(),
+            diff: "diff --git a/src/parser.rs b/src/parser.rs\n+// fix parser edge case".into(),
+            commit_style: CommitStyle::Conventional,
+            conventional_preset: ResolvedConventionalPreset {
+                name: "team".into(),
+                types: vec!["bugfix".into(), "maintenance".into()],
+            },
+        });
+
+        assert!(suggestions.options[0].starts_with("bugfix(parser): "));
     }
 }

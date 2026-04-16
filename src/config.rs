@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     env, fmt, fs,
     path::{Path, PathBuf},
 };
@@ -16,6 +17,10 @@ const KEYRING_USER: &str = "default";
 const ENV_API_TOKEN: &str = "API_TOKEN";
 const ENV_BASE_API_URL: &str = "BASE_API_URL";
 const ENV_BASE_MODEL: &str = "BASE_MODEL";
+pub const DEFAULT_CONVENTIONAL_PRESET_NAME: &str = "default";
+pub const DEFAULT_CONVENTIONAL_TYPES: [&str; 9] = [
+    "feat", "fix", "refactor", "docs", "test", "chore", "perf", "build", "ci",
+];
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -77,6 +82,37 @@ impl fmt::Display for CommitStyle {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConventionalPreset {
+    pub types: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConventionalCommitsConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preset: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub presets: BTreeMap<String, ConventionalPreset>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedConventionalPreset {
+    pub name: String,
+    pub types: Vec<String>,
+}
+
+impl ResolvedConventionalPreset {
+    pub fn built_in_default() -> Self {
+        Self {
+            name: DEFAULT_CONVENTIONAL_PRESET_NAME.to_string(),
+            types: DEFAULT_CONVENTIONAL_TYPES
+                .iter()
+                .map(|commit_type| (*commit_type).to_string())
+                .collect(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FileConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -87,6 +123,8 @@ pub struct FileConfig {
     pub base_model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub commit_style: Option<CommitStyle>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conventional_commits: Option<ConventionalCommitsConfig>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,6 +159,7 @@ pub struct ResolvedAiSettings {
     pub base_api_url: ResolvedValue<String>,
     pub base_model: ResolvedValue<String>,
     pub commit_style: ResolvedValue<CommitStyle>,
+    pub conventional_preset: ResolvedValue<ResolvedConventionalPreset>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,6 +168,7 @@ pub struct ResolvedNonSecretSettings {
     pub base_api_url: ResolvedValue<String>,
     pub base_model: ResolvedValue<String>,
     pub commit_style: ResolvedValue<CommitStyle>,
+    pub conventional_preset: ResolvedValue<ResolvedConventionalPreset>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -169,6 +209,12 @@ pub fn set_config_value(key: ConfigKey, value: &str) -> Result<PathBuf> {
         ConfigKey::CommitStyle => {
             config.commit_style = Some(parse_commit_style(value)?);
         }
+        ConfigKey::ConventionalPreset => {
+            let conventional = config
+                .conventional_commits
+                .get_or_insert_with(Default::default);
+            conventional.preset = Some(parse_conventional_preset_name(value)?);
+        }
     }
 
     save_file_to_path(&path, &config)?;
@@ -184,6 +230,12 @@ pub fn unset_config_value(key: ConfigKey) -> Result<PathBuf> {
         ConfigKey::BaseApiUrl => config.base_api_url = None,
         ConfigKey::BaseModel => config.base_model = None,
         ConfigKey::CommitStyle => config.commit_style = None,
+        ConfigKey::ConventionalPreset => {
+            if let Some(conventional) = &mut config.conventional_commits {
+                conventional.preset = None;
+            }
+            prune_empty_conventional_config(&mut config);
+        }
     }
 
     save_file_to_path(&path, &config)?;
@@ -298,6 +350,112 @@ fn parse_commit_style(raw: &str) -> Result<CommitStyle> {
     }
 }
 
+fn parse_conventional_preset_name(raw: &str) -> Result<String> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        bail!("conventional preset name cannot be empty");
+    }
+
+    if !normalized
+        .chars()
+        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-' || ch == '_')
+    {
+        bail!("conventional preset names must use lowercase ASCII letters, digits, '-' or '_'");
+    }
+
+    Ok(normalized)
+}
+
+fn parse_conventional_type(raw: &str) -> Result<String> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        bail!("conventional commit types cannot be empty");
+    }
+
+    if !normalized
+        .chars()
+        .all(|ch| ch.is_ascii_lowercase() || ch == '-')
+    {
+        bail!("conventional commit types must use lowercase ASCII letters or hyphens");
+    }
+
+    Ok(normalized)
+}
+
+fn normalize_conventional_types(types: &[String]) -> Result<Vec<String>> {
+    let mut normalized = Vec::with_capacity(types.len());
+    for commit_type in types {
+        let commit_type = parse_conventional_type(commit_type)?;
+        if !normalized.iter().any(|existing| existing == &commit_type) {
+            normalized.push(commit_type);
+        }
+    }
+
+    if normalized.is_empty() {
+        bail!("conventional presets must define at least one commit type");
+    }
+
+    Ok(normalized)
+}
+
+fn resolve_conventional_preset_from(
+    file: &FileConfig,
+) -> Result<ResolvedValue<ResolvedConventionalPreset>> {
+    let Some(config) = file.conventional_commits.as_ref() else {
+        return Ok(ResolvedValue {
+            value: ResolvedConventionalPreset::built_in_default(),
+            source: ValueSource::BuiltIn,
+        });
+    };
+
+    let mut presets = BTreeMap::new();
+    for (name, preset) in &config.presets {
+        let name = parse_conventional_preset_name(name)?;
+        if name == DEFAULT_CONVENTIONAL_PRESET_NAME {
+            bail!("custom conventional preset name 'default' is reserved");
+        }
+
+        let types = normalize_conventional_types(&preset.types)
+            .with_context(|| format!("invalid conventional preset '{name}'"))?;
+        presets.insert(name.clone(), ResolvedConventionalPreset { name, types });
+    }
+
+    let Some(preset_name) = config.preset.as_deref() else {
+        return Ok(ResolvedValue {
+            value: ResolvedConventionalPreset::built_in_default(),
+            source: ValueSource::BuiltIn,
+        });
+    };
+
+    let preset_name = parse_conventional_preset_name(preset_name)?;
+    if preset_name == DEFAULT_CONVENTIONAL_PRESET_NAME {
+        return Ok(ResolvedValue {
+            value: ResolvedConventionalPreset::built_in_default(),
+            source: ValueSource::ConfigFile,
+        });
+    }
+
+    let preset = presets
+        .remove(&preset_name)
+        .ok_or_else(|| anyhow::anyhow!("conventional preset '{preset_name}' is not defined"))?;
+    Ok(ResolvedValue {
+        value: preset,
+        source: ValueSource::ConfigFile,
+    })
+}
+
+fn prune_empty_conventional_config(config: &mut FileConfig) {
+    if config
+        .conventional_commits
+        .as_ref()
+        .is_some_and(|conventional| {
+            conventional.preset.is_none() && conventional.presets.is_empty()
+        })
+    {
+        config.conventional_commits = None;
+    }
+}
+
 pub fn resolve_ai_settings_from(
     file: &FileConfig,
     env_api_token: Option<&str>,
@@ -334,6 +492,7 @@ pub fn resolve_ai_settings_from(
         base_api_url: non_secret.base_api_url,
         base_model: non_secret.base_model,
         commit_style: non_secret.commit_style,
+        conventional_preset: non_secret.conventional_preset,
     })
 }
 
@@ -418,12 +577,14 @@ pub fn resolve_non_secret_settings_from(
             source: ValueSource::BuiltIn,
         }
     };
+    let conventional_preset = resolve_conventional_preset_from(file)?;
 
     Ok(ResolvedNonSecretSettings {
         provider,
         base_api_url,
         base_model,
         commit_style,
+        conventional_preset,
     })
 }
 
@@ -433,12 +594,15 @@ fn keyring_entry() -> Result<Entry> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use tempfile::tempdir;
 
     use super::{
-        CommitStyle, FileConfig, Provider, ValueSource, load_file_from_path, parse_commit_style,
-        parse_provider, resolve_ai_settings_from, resolve_non_secret_settings_from,
-        save_file_to_path,
+        CommitStyle, ConventionalCommitsConfig, ConventionalPreset,
+        DEFAULT_CONVENTIONAL_PRESET_NAME, FileConfig, Provider, ValueSource, load_file_from_path,
+        parse_commit_style, parse_provider, resolve_ai_settings_from,
+        resolve_non_secret_settings_from, save_file_to_path,
     };
 
     #[test]
@@ -459,6 +623,7 @@ mod tests {
                 base_api_url: Some("https://example.com/v1/".into()),
                 base_model: Some("example-model".into()),
                 commit_style: Some(CommitStyle::Conventional),
+                ..FileConfig::default()
             },
             None,
             None,
@@ -473,6 +638,10 @@ mod tests {
         assert_eq!(resolved.base_api_url.value, "https://example.com/v1");
         assert_eq!(resolved.base_model.value, "example-model");
         assert_eq!(resolved.commit_style.value, CommitStyle::Conventional);
+        assert_eq!(
+            resolved.conventional_preset.value.name,
+            DEFAULT_CONVENTIONAL_PRESET_NAME
+        );
     }
 
     #[test]
@@ -483,6 +652,7 @@ mod tests {
                 base_api_url: Some("https://example.com/v1".into()),
                 base_model: Some("from-config".into()),
                 commit_style: Some(CommitStyle::Standard),
+                ..FileConfig::default()
             },
             Some("env-token"),
             Some("https://override.example.com/api/"),
@@ -501,6 +671,7 @@ mod tests {
         assert_eq!(resolved.base_model.source, ValueSource::Environment);
         assert_eq!(resolved.base_model.value, "from-env");
         assert_eq!(resolved.commit_style.source, ValueSource::ConfigFile);
+        assert_eq!(resolved.conventional_preset.source, ValueSource::BuiltIn);
     }
 
     #[test]
@@ -515,6 +686,10 @@ mod tests {
         assert_eq!(resolved.base_model.source, ValueSource::BuiltIn);
         assert_eq!(resolved.commit_style.source, ValueSource::BuiltIn);
         assert_eq!(resolved.commit_style.value, CommitStyle::Standard);
+        assert_eq!(
+            resolved.conventional_preset.value.name,
+            DEFAULT_CONVENTIONAL_PRESET_NAME
+        );
     }
 
     #[test]
@@ -553,6 +728,15 @@ mod tests {
             base_api_url: Some("https://example.com/v1".into()),
             base_model: Some("example-model".into()),
             commit_style: Some(CommitStyle::Conventional),
+            conventional_commits: Some(ConventionalCommitsConfig {
+                preset: Some("team".into()),
+                presets: BTreeMap::from([(
+                    "team".into(),
+                    ConventionalPreset {
+                        types: vec!["feat".into(), "fix".into()],
+                    },
+                )]),
+            }),
         };
 
         save_file_to_path(&path, &config).unwrap();
@@ -576,6 +760,10 @@ mod tests {
         assert_eq!(resolved.provider.value, Provider::OpenAiCompatible);
         assert_eq!(resolved.base_api_url.value, "https://api.openai.com/v1");
         assert_eq!(resolved.base_model.value, "gpt-4.1-mini");
+        assert_eq!(
+            resolved.conventional_preset.value.name,
+            DEFAULT_CONVENTIONAL_PRESET_NAME
+        );
     }
 
     #[test]
@@ -594,6 +782,53 @@ mod tests {
     fn rejects_unknown_commit_style() {
         let error = parse_commit_style("squash").unwrap_err();
         assert!(error.to_string().contains("commit style"));
+    }
+
+    #[test]
+    fn resolves_custom_conventional_preset() {
+        let resolved = resolve_non_secret_settings_from(
+            &FileConfig {
+                commit_style: Some(CommitStyle::Conventional),
+                conventional_commits: Some(ConventionalCommitsConfig {
+                    preset: Some("backend".into()),
+                    presets: BTreeMap::from([(
+                        "backend".into(),
+                        ConventionalPreset {
+                            types: vec!["feat".into(), "bugfix".into(), "bugfix".into()],
+                        },
+                    )]),
+                }),
+                ..FileConfig::default()
+            },
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(resolved.conventional_preset.source, ValueSource::ConfigFile);
+        assert_eq!(resolved.conventional_preset.value.name, "backend");
+        assert_eq!(
+            resolved.conventional_preset.value.types,
+            vec!["feat".to_string(), "bugfix".to_string()]
+        );
+    }
+
+    #[test]
+    fn rejects_missing_custom_conventional_preset() {
+        let error = resolve_non_secret_settings_from(
+            &FileConfig {
+                conventional_commits: Some(ConventionalCommitsConfig {
+                    preset: Some("missing".into()),
+                    presets: BTreeMap::new(),
+                }),
+                ..FileConfig::default()
+            },
+            None,
+            None,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("not defined"));
     }
 
     #[test]

@@ -8,7 +8,7 @@ use crate::{
     ai::{AiClient, AiConfig},
     cli::{AuthCommand, Cli, Command, ConfigCommand},
     config::{
-        FileConfig, TokenStatus, config_path, delete_api_token, load_file, resolve_ai_settings,
+        TokenStatus, config_path, delete_api_token, load_file, resolve_ai_settings,
         resolve_non_secret_settings, save_file_to_path, set_config_value, store_api_token,
         token_status, unset_config_value,
     },
@@ -75,7 +75,14 @@ async fn run_commit(repo: &GitRepo) -> Result<()> {
 
     let config = AiConfig::load()?;
     let client = AiClient::new(config.clone())?;
-    match tui::run_commit(repo, client, config.commit_style).await? {
+    match tui::run_commit(
+        repo,
+        client,
+        config.commit_style,
+        config.conventional_preset,
+    )
+    .await?
+    {
         CommitAction::Confirmed(message) => {
             let output = repo.commit(&message)?;
             if !output.trim().is_empty() {
@@ -177,6 +184,14 @@ fn run_config(command: Option<ConfigCommand>) -> Result<()> {
                     .unwrap_or_else(|| "(not set)".to_string())
             );
             println!(
+                "Stored conventional_preset: {}",
+                stored
+                    .conventional_commits
+                    .as_ref()
+                    .and_then(|conventional| conventional.preset.as_deref())
+                    .unwrap_or("(not set)")
+            );
+            println!(
                 "Effective provider: {} ({})",
                 non_secret.provider.value, non_secret.provider.source
             );
@@ -191,6 +206,14 @@ fn run_config(command: Option<ConfigCommand>) -> Result<()> {
             println!(
                 "Effective commit_style: {} ({})",
                 non_secret.commit_style.value, non_secret.commit_style.source
+            );
+            println!(
+                "Effective conventional_preset: {} ({})",
+                non_secret.conventional_preset.value.name, non_secret.conventional_preset.source
+            );
+            println!(
+                "Effective conventional_types: {}",
+                non_secret.conventional_preset.value.types.join(", ")
             );
 
             match token_status()? {
@@ -250,12 +273,11 @@ fn run_config_setup() -> Result<()> {
         bail!("BASE_MODEL cannot be empty");
     }
 
-    let config = FileConfig {
-        provider: Some(provider),
-        base_api_url: Some(base_api_url),
-        base_model: Some(base_model.to_string()),
-        commit_style: Some(commit_style),
-    };
+    let mut config = load_file()?;
+    config.provider = Some(provider);
+    config.base_api_url = Some(base_api_url);
+    config.base_model = Some(base_model.to_string());
+    config.commit_style = Some(commit_style);
     save_file_to_path(&path, &config)?;
 
     if let Some(token) = api_token {
@@ -309,6 +331,7 @@ fn config_key_name(key: crate::cli::ConfigKey) -> &'static str {
         crate::cli::ConfigKey::BaseApiUrl => "base-api-url",
         crate::cli::ConfigKey::BaseModel => "base-model",
         crate::cli::ConfigKey::CommitStyle => "commit-style",
+        crate::cli::ConfigKey::ConventionalPreset => "conventional-preset",
     }
 }
 
@@ -347,6 +370,10 @@ async fn run_doctor(repo: &GitRepo) -> Result<()> {
                 "[ok] commit style resolved from {}",
                 resolved.commit_style.source
             );
+            println!(
+                "[ok] conventional preset resolved from {}",
+                resolved.conventional_preset.source
+            );
 
             let config = AiConfig::load()?;
             match AiClient::new(config.clone())?.check_reachability().await {
@@ -359,6 +386,11 @@ async fn run_doctor(repo: &GitRepo) -> Result<()> {
             println!("[ok] provider set to {}", config.provider);
             println!("[ok] BASE_MODEL set to {}", config.base_model);
             println!("[ok] commit style set to {}", config.commit_style);
+            println!(
+                "[ok] conventional preset set to {} [{}]",
+                config.conventional_preset.name,
+                config.conventional_preset.types.join(", ")
+            );
         }
         Err(error) => {
             failures += 1;

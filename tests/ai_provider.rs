@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use gitgud::ai::{AiClient, AiConfig, PromptInput};
-use gitgud::config::{CommitStyle, Provider};
+use gitgud::config::{CommitStyle, Provider, ResolvedConventionalPreset};
 use mockito::{Matcher, Server};
 
 fn prompt() -> PromptInput {
@@ -11,6 +11,7 @@ fn prompt() -> PromptInput {
         diff_stat: "1 file changed".into(),
         diff: "diff --git a/src/main.rs b/src/main.rs".into(),
         commit_style: CommitStyle::Standard,
+        conventional_preset: ResolvedConventionalPreset::built_in_default(),
     }
 }
 
@@ -34,6 +35,7 @@ async fn generates_commit_message_from_mock_server() {
         &server.url(),
         "model",
         CommitStyle::Standard,
+        ResolvedConventionalPreset::built_in_default(),
     )
     .unwrap();
     let client = AiClient::new(config).unwrap();
@@ -60,6 +62,7 @@ async fn surfaces_split_commit_suggestions_from_mock_server() {
         &server.url(),
         "model",
         CommitStyle::Conventional,
+        ResolvedConventionalPreset::built_in_default(),
     )
     .unwrap();
     let client = AiClient::new(config).unwrap();
@@ -95,6 +98,7 @@ async fn surfaces_auth_errors() {
         &server.url(),
         "model",
         CommitStyle::Standard,
+        ResolvedConventionalPreset::built_in_default(),
     )
     .unwrap();
     let client = AiClient::new(config).unwrap();
@@ -119,6 +123,7 @@ async fn surfaces_rate_limits() {
         &server.url(),
         "model",
         CommitStyle::Standard,
+        ResolvedConventionalPreset::built_in_default(),
     )
     .unwrap();
     let client = AiClient::new(config).unwrap();
@@ -143,6 +148,7 @@ async fn rejects_malformed_json() {
         &server.url(),
         "model",
         CommitStyle::Standard,
+        ResolvedConventionalPreset::built_in_default(),
     )
     .unwrap();
     let client = AiClient::new(config).unwrap();
@@ -170,6 +176,7 @@ async fn times_out_when_server_hangs() {
         &server.url(),
         "model",
         CommitStyle::Standard,
+        ResolvedConventionalPreset::built_in_default(),
     )
     .unwrap()
     .with_timeout(Duration::from_millis(50));

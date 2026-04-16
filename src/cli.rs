@@ -72,6 +72,7 @@ pub enum ConfigKey {
     BaseApiUrl,
     BaseModel,
     CommitStyle,
+    ConventionalPreset,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

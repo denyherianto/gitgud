@@ -23,9 +23,10 @@ use tui_textarea::{Input, Key, TextArea};
 
 use crate::{
     ai::{
-        AiClient, CommitSuggestions, PromptInput, normalize_base_api_url, validate_commit_message,
+        AiClient, CommitSuggestions, PromptInput, normalize_base_api_url,
+        validate_commit_message_with_preset,
     },
-    config::{CommitStyle, Provider, TokenStatus},
+    config::{CommitStyle, Provider, ResolvedConventionalPreset, TokenStatus},
     git::{GitRepo, PushPlan, RepoStatus},
 };
 
@@ -83,6 +84,7 @@ pub async fn run_commit(
     repo: &GitRepo,
     ai: AiClient,
     commit_style: CommitStyle,
+    conventional_preset: ResolvedConventionalPreset,
 ) -> Result<CommitAction> {
     let branch = repo.current_branch().or_else(|error| {
         show_message("Cannot Commit", &error.to_string())?;
@@ -102,9 +104,14 @@ pub async fn run_commit(
         diff_stat: staged.diff_stat,
         diff: staged.diff,
         commit_style,
+        conventional_preset: conventional_preset.clone(),
     };
 
-    let mut state = CommitView::new(input.staged_files.clone(), commit_style);
+    let mut state = CommitView::new(
+        input.staged_files.clone(),
+        commit_style,
+        conventional_preset,
+    );
     state.start_generation(ai, input);
     with_terminal(|terminal| commit_loop(terminal, &mut state))
 }
@@ -269,7 +276,11 @@ fn handle_commit_browsing_key(state: &mut CommitView, key: KeyEvent) -> Result<b
             if !matches!(state.generation, GenerationState::Ready) || state.drafts.is_empty() {
                 return Ok(false);
             }
-            let message = validate_commit_message(&state.current_message(), state.commit_style)?;
+            let message = validate_commit_message_with_preset(
+                &state.current_message(),
+                state.commit_style,
+                &state.conventional_preset,
+            )?;
             state.confirmed_message = Some(message);
             Ok(true)
         }
@@ -508,12 +519,31 @@ fn build_commit_status_lines(state: &CommitView) -> Vec<Line<'static>> {
         GenerationState::Error(error) => error.as_str(),
     };
 
+    let style_line = if matches!(state.commit_style, CommitStyle::Conventional) {
+        format!(
+            "Style: {} ({})",
+            state.commit_style, state.conventional_preset.name
+        )
+    } else {
+        format!("Style: {}", state.commit_style)
+    };
+
     let mut lines = vec![
-        Line::from(format!("Style: {}", state.commit_style)),
+        Line::from(style_line),
         Line::from(format!("Staged count: {}", state.staged_files.len())),
         Line::from("Left/Right scroll staged tree  PgUp/PgDn jump  Home/End edges"),
         Line::from(status_text.to_string()),
     ];
+
+    if matches!(state.commit_style, CommitStyle::Conventional) {
+        lines.insert(
+            1,
+            Line::from(format!(
+                "Allowed types: {}",
+                state.conventional_preset.types.join(", ")
+            )),
+        );
+    }
 
     if matches!(state.generation, GenerationState::Ready) && !state.split_suggestions.is_empty() {
         lines.push(Line::from(vec![Span::styled(
@@ -777,10 +807,15 @@ struct CommitView {
     confirmed_message: Option<String>,
     cancelled: bool,
     commit_style: CommitStyle,
+    conventional_preset: ResolvedConventionalPreset,
 }
 
 impl CommitView {
-    fn new(staged_files: Vec<String>, commit_style: CommitStyle) -> Self {
+    fn new(
+        staged_files: Vec<String>,
+        commit_style: CommitStyle,
+        conventional_preset: ResolvedConventionalPreset,
+    ) -> Self {
         Self {
             textarea: make_textarea("Draft", "Generating commit message options..."),
             generation: GenerationState::Loading,
@@ -796,6 +831,7 @@ impl CommitView {
             confirmed_message: None,
             cancelled: false,
             commit_style,
+            conventional_preset,
         }
     }
 
@@ -1091,7 +1127,7 @@ impl ConfigSetupView {
                 "Enter a new API token to store it in the system keychain. Leave it blank to keep the current token.".to_string()
             }
             ConfigField::CommitStyle => {
-                "Choose `standard` for plain Git subjects or `conventional` for Conventional Commits.".to_string()
+                "Choose `standard` for plain Git subjects or `conventional` for Conventional Commits. Custom Conventional Commit presets can be selected with `gg config set conventional-preset <name>` after defining them in the config file.".to_string()
             }
             ConfigField::Save => {
                 "Save the current settings. BASE_API_URL and BASE_MODEL are written to the config file; API_TOKEN is stored in the keychain.".to_string()
@@ -1244,7 +1280,7 @@ mod tests {
     use super::{
         CommitMode, CommitView, GenerationState, build_commit_status_lines, staged_files_tree_lines,
     };
-    use crate::config::CommitStyle;
+    use crate::config::{CommitStyle, ResolvedConventionalPreset};
 
     fn plain_text(lines: Vec<ratatui::text::Line<'static>>) -> Vec<String> {
         lines
@@ -1259,7 +1295,11 @@ mod tests {
     }
 
     fn ready_commit_view() -> CommitView {
-        let mut state = CommitView::new(vec!["src/tui.rs".to_string()], CommitStyle::Standard);
+        let mut state = CommitView::new(
+            vec!["src/tui.rs".to_string()],
+            CommitStyle::Standard,
+            ResolvedConventionalPreset::built_in_default(),
+        );
         state.generation = GenerationState::Ready;
         state.mode = CommitMode::Browsing;
         state

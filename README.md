@@ -11,7 +11,7 @@
 - Generate 1-3 commit message options from the staged diff
 - Detect mixed staged concerns and suggest cleaner split commits before you commit
 - Choose an option in the TUI and edit it inline before committing
-- Support standard and Conventional Commits styles
+- Support standard and Conventional Commits styles, including configurable presets
 - Push the current branch to its upstream automatically
 - Offer `--force-with-lease` only after explicit confirmation
 - Configure provider, endpoint, model, token, and commit style in one setup screen
@@ -56,6 +56,39 @@ Supported environment overrides:
 - `BASE_API_URL`
 - `BASE_MODEL`
 
+### Conventional Commit Presets
+
+`conventional` mode supports this built-in default preset:
+
+- `feat`
+- `fix`
+- `refactor`
+- `docs`
+- `test`
+- `chore`
+- `perf`
+- `build`
+- `ci`
+
+You can also define custom team presets in the config file and select one with:
+
+```bash
+gg config set conventional-preset team
+gg config unset conventional-preset
+```
+
+Example config:
+
+```toml
+commit_style = "conventional"
+
+[conventional_commits]
+preset = "team"
+
+[conventional_commits.presets.team]
+types = ["feature", "bugfix", "maintenance"]
+```
+
 ## Usage
 
 Build or run with Cargo:
@@ -64,6 +97,7 @@ Build or run with Cargo:
 cargo run --bin gg -- --help
 cargo run --bin gg -- config
 cargo run --bin gg -- config show
+cargo run --bin gg -- config set conventional-preset team
 cargo run --bin gg -- auth status
 cargo run --bin gg -- doctor
 cargo run --bin gg -- commit
@@ -146,7 +180,7 @@ gg git push --force-with-lease
 - warns when the staged diff looks like multiple concerns and suggests split commits
 - lets you choose one option in the TUI
 - supports inline editing before commit
-- respects the configured commit style, including Conventional Commits mode
+- respects the configured commit style, including Conventional Commits presets
 - commits only after confirmation
 
 Keys:
@@ -175,8 +209,10 @@ Keys:
   - `BASE_MODEL`
   - `API_TOKEN`
   - commit style preference
+  - active Conventional Commit preset selection
 - stores non-secret settings in the config file
 - stores `API_TOKEN` in the system keychain
+- preserves custom Conventional Commit preset definitions already stored in the config file
 
 ### `gg doctor`
 
