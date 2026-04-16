@@ -1,5 +1,5 @@
 [package]
-name = "git-buddy"
+name = "gitgud"
 version = "0.1.0"
 edition = "2024"
 description = "A terminal UI for Git with AI-assisted commit and push workflows"
@@ -9,7 +9,7 @@ keywords = ["git", "cli", "tui", "ai"]
 categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
-name = "gitbuddy"
+name = "gg"
 path = "src/main.rs"
 
 [dependencies]

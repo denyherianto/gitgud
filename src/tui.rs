@@ -340,7 +340,7 @@ fn draw_home(frame: &mut ratatui::Frame<'_>, status: &RepoStatus) {
             Span::raw(remote_status),
         ]),
     ])
-    .block(Block::default().borders(Borders::ALL).title("Git Buddy"))
+    .block(Block::default().borders(Borders::ALL).title("gitgud"))
     .alignment(Alignment::Left);
 
     let shortcuts = Paragraph::new(vec![

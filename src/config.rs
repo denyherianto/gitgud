@@ -9,9 +9,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{ai::normalize_base_api_url, cli::ConfigKey};
 
-const CONFIG_DIR_NAME: &str = "git-buddy";
+const CONFIG_DIR_NAME: &str = "gitgud";
 const CONFIG_FILE_NAME: &str = "config.toml";
-const KEYRING_SERVICE: &str = "git-buddy";
+const KEYRING_SERVICE: &str = "gitgud";
 const KEYRING_USER: &str = "default";
 const ENV_API_TOKEN: &str = "API_TOKEN";
 const ENV_BASE_API_URL: &str = "BASE_API_URL";
@@ -325,9 +325,7 @@ pub fn resolve_ai_settings_from(
             source: ValueSource::Keychain,
         }
     } else {
-        bail!(
-            "missing API token; run `gitbuddy config` or `gitbuddy auth login`, or set API_TOKEN"
-        );
+        bail!("missing API token; run `gg config` or `gg auth login`, or set API_TOKEN");
     };
 
     Ok(ResolvedAiSettings {

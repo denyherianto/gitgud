@@ -4,7 +4,7 @@ use crate::config::{CommitStyle, Provider};
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "gitbuddy",
+    name = "gg",
     about = "A Git CLI with AI-assisted commit, push, and setup flows"
 )]
 pub struct Cli {

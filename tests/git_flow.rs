@@ -1,6 +1,6 @@
 use std::{fs, path::Path, process::Command};
 
-use git_buddy::git::{GitRepo, PushPlan};
+use gitgud::git::{GitRepo, PushPlan};
 use tempfile::TempDir;
 
 fn run(dir: &Path, args: &[&str]) -> String {

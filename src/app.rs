@@ -255,9 +255,7 @@ fn run_auth(command: AuthCommand) -> Result<()> {
                     println!("API token available from the system keychain");
                 }
                 TokenStatus::Missing => {
-                    println!(
-                        "No API token configured; run `gitbuddy config` or `gitbuddy auth login`"
-                    );
+                    println!("No API token configured; run `gg config` or `gg auth login`");
                 }
             }
             Ok(())

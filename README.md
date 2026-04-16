@@ -1,6 +1,10 @@
-# Git Buddy
+# gitgud
 
-`gitbuddy` is a Rust CLI that adds a terminal UI and AI-assisted workflows on top of normal Git commands.
+`gitgud` is a Rust CLI that adds a terminal UI and AI-assisted workflows on top of normal Git commands.
+
+<p align="center">
+  <img src="./assets/gitgud-repo-illustration.svg" alt="Stylized gitgud repository illustration" width="720">
+</p>
 
 ## Features
 
@@ -21,12 +25,12 @@
 
 ## Configuration
 
-`gitbuddy` supports persistent global config plus secure token storage.
+`gitgud` supports persistent global config plus secure token storage.
 
 Recommended setup:
 
 ```bash
-cargo run --bin gitbuddy -- config
+cargo run --bin gg -- config
 ```
 
 What this does:
@@ -36,7 +40,7 @@ What this does:
 - stores non-secret defaults in the standard per-user config directory
 - keeps environment variables available for one-off overrides
 
-Use `gitbuddy config show` to see the exact config file path on your platform.
+Use `gg config show` to see the exact config file path on your platform.
 
 Current precedence:
 
@@ -55,27 +59,48 @@ Supported environment overrides:
 Build or run with Cargo:
 
 ```bash
-cargo run --bin gitbuddy -- --help
-cargo run --bin gitbuddy -- config
-cargo run --bin gitbuddy -- config show
-cargo run --bin gitbuddy -- auth status
-cargo run --bin gitbuddy -- doctor
-cargo run --bin gitbuddy -- commit
-cargo run --bin gitbuddy -- push
+cargo run --bin gg -- --help
+cargo run --bin gg -- config
+cargo run --bin gg -- config show
+cargo run --bin gg -- auth status
+cargo run --bin gg -- doctor
+cargo run --bin gg -- commit
+cargo run --bin gg -- push
 ```
 
 After building:
 
 ```bash
 cargo build --release
-./target/release/gitbuddy
-./target/release/gitbuddy commit
-./target/release/gitbuddy push
+./target/release/gg
+./target/release/gg commit
+./target/release/gg push
 ```
+
+## Install
+
+Install the latest GitHub release:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/denyherianto/gitgud/main/install.sh | sh
+```
+
+Install a specific release:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/denyherianto/gitgud/main/install.sh | sh -s -- --version v0.1.0
+```
+
+The installer expects GitHub release assets named like:
+
+- `gg-darwin-arm64.tar.gz`
+- `gg-darwin-x86_64.tar.gz`
+- `gg-linux-arm64.tar.gz`
+- `gg-linux-x86_64.tar.gz`
 
 ## Command Behavior
 
-### `gitbuddy`
+### `gg`
 
 Opens the home TUI and shows:
 
@@ -90,7 +115,7 @@ Keys:
 - `p` push current branch
 - `q` quit
 
-### `gitbuddy commit`
+### `gg commit`
 
 - requires staged changes
 - reads the staged diff
@@ -109,7 +134,7 @@ Keys:
 - `Esc` cancel
 - `Ctrl-S` leave edit mode
 
-### `gitbuddy push`
+### `gg push`
 
 - detects the current branch
 - checks whether an upstream already exists
@@ -117,7 +142,7 @@ Keys:
 - offers `--force-with-lease` only after explicit confirmation if the normal push is rejected
 - errors when the first push target is ambiguous instead of guessing across multiple remotes
 
-### `gitbuddy config`
+### `gg config`
 
 - opens a setup screen by default
 - configures:
@@ -129,7 +154,7 @@ Keys:
 - stores non-secret settings in the config file
 - stores `API_TOKEN` in the system keychain
 
-### `gitbuddy doctor`
+### `gg doctor`
 
 Checks:
 
@@ -142,7 +167,7 @@ Checks:
 ## Notes
 
 - Only staged changes are used to generate the commit message.
-- `gitbuddy` shells out to the system `git` binary, so hooks, credentials, and your normal Git config still apply.
+- `gitgud` shells out to the system `git` binary, so hooks, credentials, and your normal Git config still apply.
 - Detached HEAD is rejected for commit and push flows.
 
 ## Testing

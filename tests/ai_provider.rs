@@ -1,7 +1,7 @@
 use std::time::Duration;
 
-use git_buddy::ai::{AiClient, AiConfig, PromptInput};
-use git_buddy::config::{CommitStyle, Provider};
+use gitgud::ai::{AiClient, AiConfig, PromptInput};
+use gitgud::config::{CommitStyle, Provider};
 use mockito::{Matcher, Server};
 
 fn prompt() -> PromptInput {

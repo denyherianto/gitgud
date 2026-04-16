@@ -1,6 +1,6 @@
 #[tokio::main]
 async fn main() {
-    if let Err(error) = git_buddy::run().await {
+    if let Err(error) = gitgud::run().await {
         eprintln!("error: {error:#}");
         std::process::exit(1);
     }
