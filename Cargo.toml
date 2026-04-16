@@ -8,6 +8,10 @@ readme = "README.md"
 keywords = ["git", "cli", "tui", "ai"]
 categories = ["command-line-utilities", "development-tools"]
 
+[[bin]]
+name = "gitbuddy"
+path = "src/main.rs"
+
 [dependencies]
 anyhow = "1.0.97"
 clap = { version = "4.5.37", features = ["derive"] }

@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use git_buddy::ai::{AiClient, AiConfig, PromptInput};
+use git_buddy::config::{CommitStyle, Provider};
 use mockito::{Matcher, Server};
 
 fn prompt() -> PromptInput {
@@ -9,6 +10,7 @@ fn prompt() -> PromptInput {
         staged_files: vec!["src/main.rs".into()],
         diff_stat: "1 file changed".into(),
         diff: "diff --git a/src/main.rs b/src/main.rs".into(),
+        commit_style: CommitStyle::Standard,
     }
 }
 
@@ -22,17 +24,23 @@ async fn generates_commit_message_from_mock_server() {
             "model": "model",
         })))
         .with_status(200)
-        .with_body(
-            r#"{"choices":[{"message":{"content":"Add TUI commit flow\n\nHandle editing state"}}]}"#,
-        )
+        .with_body(r#"{"choices":[{"message":{"content":"{\"options\":[\"Add TUI commit flow\",\"Refine push handling\",\"Improve config setup\"]}"}}]}"#)
         .create_async()
         .await;
 
-    let config = AiConfig::new("token".into(), &server.url(), "model").unwrap();
+    let config = AiConfig::new(
+        "token".into(),
+        Provider::Gemini,
+        &server.url(),
+        "model",
+        CommitStyle::Standard,
+    )
+    .unwrap();
     let client = AiClient::new(config).unwrap();
-    let message = client.generate_commit_message(&prompt()).await.unwrap();
+    let options = client.generate_commit_options(&prompt()).await.unwrap();
 
-    assert_eq!(message, "Add TUI commit flow\n\nHandle editing state");
+    assert_eq!(options.len(), 3);
+    assert_eq!(options[0], "Add TUI commit flow");
 }
 
 #[tokio::test]
@@ -45,9 +53,16 @@ async fn surfaces_auth_errors() {
         .create_async()
         .await;
 
-    let config = AiConfig::new("token".into(), &server.url(), "model").unwrap();
+    let config = AiConfig::new(
+        "token".into(),
+        Provider::Gemini,
+        &server.url(),
+        "model",
+        CommitStyle::Standard,
+    )
+    .unwrap();
     let client = AiClient::new(config).unwrap();
-    let error = client.generate_commit_message(&prompt()).await.unwrap_err();
+    let error = client.generate_commit_options(&prompt()).await.unwrap_err();
 
     assert!(error.to_string().contains("401"));
 }
@@ -62,9 +77,16 @@ async fn surfaces_rate_limits() {
         .create_async()
         .await;
 
-    let config = AiConfig::new("token".into(), &server.url(), "model").unwrap();
+    let config = AiConfig::new(
+        "token".into(),
+        Provider::Gemini,
+        &server.url(),
+        "model",
+        CommitStyle::Standard,
+    )
+    .unwrap();
     let client = AiClient::new(config).unwrap();
-    let error = client.generate_commit_message(&prompt()).await.unwrap_err();
+    let error = client.generate_commit_options(&prompt()).await.unwrap_err();
 
     assert!(error.to_string().contains("429"));
 }
@@ -79,9 +101,16 @@ async fn rejects_malformed_json() {
         .create_async()
         .await;
 
-    let config = AiConfig::new("token".into(), &server.url(), "model").unwrap();
+    let config = AiConfig::new(
+        "token".into(),
+        Provider::Gemini,
+        &server.url(),
+        "model",
+        CommitStyle::Standard,
+    )
+    .unwrap();
     let client = AiClient::new(config).unwrap();
-    let error = client.generate_commit_message(&prompt()).await.unwrap_err();
+    let error = client.generate_commit_options(&prompt()).await.unwrap_err();
 
     assert!(error.to_string().contains("parse AI response JSON"));
 }
@@ -99,11 +128,17 @@ async fn times_out_when_server_hangs() {
         .create_async()
         .await;
 
-    let config = AiConfig::new("token".into(), &server.url(), "model")
-        .unwrap()
-        .with_timeout(Duration::from_millis(50));
+    let config = AiConfig::new(
+        "token".into(),
+        Provider::Gemini,
+        &server.url(),
+        "model",
+        CommitStyle::Standard,
+    )
+    .unwrap()
+    .with_timeout(Duration::from_millis(50));
     let client = AiClient::new(config).unwrap();
-    let error = client.generate_commit_message(&prompt()).await.unwrap_err();
+    let error = client.generate_commit_options(&prompt()).await.unwrap_err();
 
     let rendered = format!("{error:#}");
     assert!(

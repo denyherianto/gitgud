@@ -21,7 +21,8 @@ use ratatui::{
 use tui_textarea::{Input, Key, TextArea};
 
 use crate::{
-    ai::{AiClient, PromptInput, validate_commit_message},
+    ai::{AiClient, PromptInput, normalize_base_api_url, validate_commit_message},
+    config::{CommitStyle, Provider, TokenStatus},
     git::{GitRepo, PushPlan, RepoStatus},
 };
 
@@ -39,9 +40,23 @@ pub enum CommitAction {
     Cancelled,
 }
 
-pub enum PushAction {
-    Confirmed(PushPlan),
-    Cancelled,
+#[derive(Debug, Clone)]
+pub struct ConfigSetupInput {
+    pub provider: Provider,
+    pub base_api_url: String,
+    pub base_model: String,
+    pub commit_style: CommitStyle,
+    pub token_status: TokenStatus,
+    pub token_present: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConfigSetupAction {
+    pub provider: Provider,
+    pub base_api_url: String,
+    pub base_model: String,
+    pub commit_style: CommitStyle,
+    pub api_token: Option<String>,
 }
 
 pub fn run_home(status: &RepoStatus) -> Result<HomeAction> {
@@ -61,7 +76,11 @@ pub fn run_home(status: &RepoStatus) -> Result<HomeAction> {
     })
 }
 
-pub async fn run_commit(repo: &GitRepo, ai: AiClient) -> Result<CommitAction> {
+pub async fn run_commit(
+    repo: &GitRepo,
+    ai: AiClient,
+    commit_style: CommitStyle,
+) -> Result<CommitAction> {
     let branch = repo.current_branch().or_else(|error| {
         show_message("Cannot Commit", &error.to_string())?;
         Err(error)
@@ -69,7 +88,7 @@ pub async fn run_commit(repo: &GitRepo, ai: AiClient) -> Result<CommitAction> {
     let staged = repo.staged_changes()?;
 
     if staged.staged_files.is_empty() {
-        let message = "No staged changes found. Stage files before generating a commit message.";
+        let message = "No staged changes found. Stage files before generating commit messages.";
         show_message("Cannot Commit", message)?;
         bail!(message);
     }
@@ -79,35 +98,21 @@ pub async fn run_commit(repo: &GitRepo, ai: AiClient) -> Result<CommitAction> {
         staged_files: staged.staged_files.clone(),
         diff_stat: staged.diff_stat,
         diff: staged.diff,
+        commit_style,
     };
 
-    let mut state = CommitView::new(input.staged_files.clone());
+    let mut state = CommitView::new(input.staged_files.clone(), commit_style);
     state.start_generation(ai, input);
-    let action = with_terminal(|terminal| commit_loop(terminal, &mut state))?;
-
-    match action {
-        CommitAction::Confirmed(message) => Ok(CommitAction::Confirmed(message)),
-        CommitAction::Cancelled => Ok(CommitAction::Cancelled),
-    }
+    with_terminal(|terminal| commit_loop(terminal, &mut state))
 }
 
-pub fn run_push(repo: &GitRepo) -> Result<PushAction> {
-    let plan = repo.plan_push().or_else(|error| {
-        show_message("Cannot Push", &error.to_string())?;
-        Err(error)
-    })?;
+pub fn run_config_setup(input: ConfigSetupInput) -> Result<Option<ConfigSetupAction>> {
+    let mut state = ConfigSetupView::new(input);
+    with_terminal(|terminal| config_setup_loop(terminal, &mut state))
+}
 
-    if let PushPlan::ChooseRemote { remotes, branch } = &plan {
-        if remotes.is_empty() {
-            let message = "No remotes found for this repository.";
-            show_message("Cannot Push", message)?;
-            bail!(message);
-        }
-
-        with_terminal(|terminal| push_picker_loop(terminal, remotes, branch))
-    } else {
-        with_terminal(|terminal| push_confirm_loop(terminal, &plan))
-    }
+pub fn confirm_force_push(plan: &PushPlan, error_message: &str) -> Result<bool> {
+    with_terminal(|terminal| force_push_loop(terminal, plan, error_message))
 }
 
 pub fn show_message(title: &str, message: &str) -> Result<()> {
@@ -138,67 +143,56 @@ fn commit_loop(terminal: &mut AppTerminal, state: &mut CommitView) -> Result<Com
             match state.mode {
                 CommitMode::Browsing => {
                     if handle_commit_browsing_key(state, key)? {
-                        if let Some(result) = state.take_confirmed_message()? {
-                            return Ok(CommitAction::Confirmed(result));
+                        if let Some(message) = state.take_confirmed_message() {
+                            return Ok(CommitAction::Confirmed(message));
                         }
                         if state.cancelled {
                             return Ok(CommitAction::Cancelled);
                         }
                     }
                 }
-                CommitMode::Editing => handle_commit_editing_key(state, key)?,
+                CommitMode::Editing => handle_commit_editing_key(state, key),
             }
         }
     }
 }
 
-fn push_confirm_loop(terminal: &mut AppTerminal, plan: &PushPlan) -> Result<PushAction> {
-    loop {
-        terminal.draw(|frame| draw_push_confirm(frame, plan))?;
-
-        if let Event::Key(key) = event::read()? {
-            match key.code {
-                KeyCode::Enter => return Ok(PushAction::Confirmed(plan.clone())),
-                KeyCode::Esc => return Ok(PushAction::Cancelled),
-                _ => {}
-            }
-        }
-    }
-}
-
-fn push_picker_loop(
+fn config_setup_loop(
     terminal: &mut AppTerminal,
-    remotes: &[String],
-    branch: &str,
-) -> Result<PushAction> {
-    let mut state = ListState::default().with_selected(Some(0));
-
+    state: &mut ConfigSetupView,
+) -> Result<Option<ConfigSetupAction>> {
     loop {
-        terminal.draw(|frame| draw_push_picker(frame, remotes, branch, &state))?;
+        terminal.draw(|frame| draw_config_setup(frame, state))?;
+
+        if !event::poll(Duration::from_millis(100))? {
+            continue;
+        }
+
+        if let Event::Key(key) = event::read()? {
+            match state.mode {
+                ConfigMode::Browsing => {
+                    if let Some(action) = handle_config_browsing_key(state, key)? {
+                        return Ok(Some(action));
+                    }
+                }
+                ConfigMode::Editing => handle_config_editing_key(state, key)?,
+            }
+        }
+    }
+}
+
+fn force_push_loop(
+    terminal: &mut AppTerminal,
+    plan: &PushPlan,
+    error_message: &str,
+) -> Result<bool> {
+    loop {
+        terminal.draw(|frame| draw_force_push_confirm(frame, plan, error_message))?;
 
         if let Event::Key(key) = event::read()? {
             match key.code {
-                KeyCode::Up => {
-                    let current = state.selected().unwrap_or(0);
-                    let next = current.saturating_sub(1);
-                    state.select(Some(next));
-                }
-                KeyCode::Down => {
-                    let current = state.selected().unwrap_or(0);
-                    let next = (current + 1).min(remotes.len().saturating_sub(1));
-                    state.select(Some(next));
-                }
-                KeyCode::Enter => {
-                    let index = state.selected().unwrap_or(0);
-                    let remote = remotes
-                        .get(index)
-                        .ok_or_else(|| anyhow!("invalid remote selection"))?;
-                    return Ok(PushAction::Confirmed(PushPlan::SetUpstream {
-                        remote: remote.clone(),
-                        branch: branch.to_string(),
-                    }));
-                }
-                KeyCode::Esc => return Ok(PushAction::Cancelled),
+                KeyCode::Enter => return Ok(true),
+                KeyCode::Esc => return Ok(false),
                 _ => {}
             }
         }
@@ -207,19 +201,30 @@ fn push_picker_loop(
 
 fn handle_commit_browsing_key(state: &mut CommitView, key: KeyEvent) -> Result<bool> {
     match key.code {
+        KeyCode::Up => {
+            state.move_selection(-1);
+            Ok(false)
+        }
+        KeyCode::Down => {
+            state.move_selection(1);
+            Ok(false)
+        }
         KeyCode::Char('r') => {
             state.restart_generation()?;
             Ok(false)
         }
         KeyCode::Char('e') => {
-            if matches!(state.generation, GenerationState::Ready) {
+            if matches!(state.generation, GenerationState::Ready) && !state.drafts.is_empty() {
                 state.mode = CommitMode::Editing;
                 state.textarea.set_cursor_line_style(Style::default());
             }
             Ok(false)
         }
         KeyCode::Enter => {
-            let message = validate_commit_message(&state.textarea.lines().join("\n"))?;
+            if !matches!(state.generation, GenerationState::Ready) || state.drafts.is_empty() {
+                return Ok(false);
+            }
+            let message = validate_commit_message(&state.current_message(), state.commit_style)?;
             state.confirmed_message = Some(message);
             Ok(true)
         }
@@ -231,19 +236,68 @@ fn handle_commit_browsing_key(state: &mut CommitView, key: KeyEvent) -> Result<b
     }
 }
 
-fn handle_commit_editing_key(state: &mut CommitView, key: KeyEvent) -> Result<()> {
+fn handle_commit_editing_key(state: &mut CommitView, key: KeyEvent) {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
+        state.sync_current_draft();
         state.mode = CommitMode::Browsing;
-        return Ok(());
+        return;
     }
 
     if key.code == KeyCode::Esc {
+        state.sync_current_draft();
         state.mode = CommitMode::Browsing;
+        return;
+    }
+
+    state.textarea.input(key_event_to_textarea_input(key));
+}
+
+fn handle_config_browsing_key(
+    state: &mut ConfigSetupView,
+    key: KeyEvent,
+) -> Result<Option<ConfigSetupAction>> {
+    match key.code {
+        KeyCode::Up => state.move_selection(-1),
+        KeyCode::Down => state.move_selection(1),
+        KeyCode::Left => state.cycle_selected(false),
+        KeyCode::Right => state.cycle_selected(true),
+        KeyCode::Char('e') => state.begin_editing_selected(),
+        KeyCode::Char('s') => match state.save() {
+            Ok(action) => return Ok(action),
+            Err(error) => state.error = Some(error.to_string()),
+        },
+        KeyCode::Enter => match state.selected_field() {
+            ConfigField::Provider | ConfigField::CommitStyle => state.cycle_selected(true),
+            ConfigField::BaseApiUrl | ConfigField::BaseModel | ConfigField::ApiToken => {
+                state.begin_editing_selected()
+            }
+            ConfigField::Save => match state.save() {
+                Ok(action) => return Ok(action),
+                Err(error) => state.error = Some(error.to_string()),
+            },
+            ConfigField::Cancel => return Ok(None),
+        },
+        KeyCode::Esc => return Ok(None),
+        _ => {}
+    }
+
+    Ok(None)
+}
+
+fn handle_config_editing_key(state: &mut ConfigSetupView, key: KeyEvent) -> Result<()> {
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
+        state.finish_editing(true)?;
         return Ok(());
     }
 
-    let input = key_event_to_textarea_input(key);
-    state.textarea.input(input);
+    match key.code {
+        KeyCode::Enter => state.finish_editing(true)?,
+        KeyCode::Esc => state.finish_editing(false)?,
+        _ => {
+            state.textarea.input(key_event_to_textarea_input(key));
+        }
+    }
+
     Ok(())
 }
 
@@ -306,35 +360,58 @@ fn draw_commit(frame: &mut ratatui::Frame<'_>, state: &CommitView) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(4),
-            Constraint::Min(8),
+            Constraint::Min(10),
             Constraint::Length(3),
         ])
         .split(frame.area());
+    let content = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(34), Constraint::Percentage(66)])
+        .split(layout[1]);
 
     let status_text = match &state.generation {
-        GenerationState::Loading => "Generating commit message from staged diff...",
-        GenerationState::Ready => "Review the message, press Enter to commit, or e to edit.",
+        GenerationState::Loading => "Generating 3-5 commit message options from the staged diff...",
+        GenerationState::Ready => "Choose an option, edit if needed, then press Enter to commit.",
         GenerationState::Error(error) => error,
     };
-
     let status_block = Paragraph::new(vec![
+        Line::from(format!("Style: {}", state.commit_style)),
         Line::from(format!("Staged files: {}", state.staged_files.join(", "))),
         Line::from(status_text),
     ])
-    .block(Block::default().borders(Borders::ALL).title("Commit Draft"))
+    .block(Block::default().borders(Borders::ALL).title("Commit"))
     .wrap(Wrap { trim: false });
 
-    let help_text = match state.mode {
-        CommitMode::Browsing => "r regenerate  e edit  Enter commit  Esc cancel".to_string(),
-        CommitMode::Editing => "Editing mode: type freely, Ctrl-S or Esc to return".to_string(),
+    let options = if state.options.is_empty() {
+        vec![ListItem::new("(waiting for options)")]
+    } else {
+        state
+            .options
+            .iter()
+            .enumerate()
+            .map(|(index, option)| {
+                let subject = option.lines().next().unwrap_or("(empty)");
+                ListItem::new(format!("{}. {}", index + 1, subject))
+            })
+            .collect::<Vec<_>>()
     };
+    let options_list = List::new(options)
+        .block(Block::default().borders(Borders::ALL).title("Options"))
+        .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan))
+        .highlight_symbol("> ");
 
+    let help_text = match state.mode {
+        CommitMode::Browsing => "Up/Down select  e edit  r regenerate  Enter commit  Esc cancel",
+        CommitMode::Editing => "Edit draft inline. Ctrl-S or Esc returns to browse mode.",
+    };
     let help = Paragraph::new(help_text)
         .block(Block::default().borders(Borders::ALL).title("Keys"))
         .alignment(Alignment::Center);
+    let mut list_state = state.list_state.clone();
 
     frame.render_widget(status_block, layout[0]);
-    frame.render_widget(&state.textarea, layout[1]);
+    frame.render_stateful_widget(options_list, content[0], &mut list_state);
+    frame.render_widget(&state.textarea, content[1]);
     frame.render_widget(help, layout[2]);
 
     if matches!(state.mode, CommitMode::Editing) {
@@ -343,64 +420,90 @@ fn draw_commit(frame: &mut ratatui::Frame<'_>, state: &CommitView) {
     }
 }
 
-fn draw_push_confirm(frame: &mut ratatui::Frame<'_>, plan: &PushPlan) {
-    let message = match plan {
-        PushPlan::Upstream { branch } => {
-            format!("Push branch '{branch}' to its configured upstream?")
-        }
-        PushPlan::SetUpstream { remote, branch } => {
-            format!("Push branch '{branch}' and set upstream to '{remote}'?")
-        }
-        PushPlan::ChooseRemote { .. } => "Choose a remote".to_string(),
-    };
-
-    draw_message(frame, "Push Confirmation", &message);
-}
-
-fn draw_push_picker(
-    frame: &mut ratatui::Frame<'_>,
-    remotes: &[String],
-    branch: &str,
-    state: &ListState,
-) {
+fn draw_config_setup(frame: &mut ratatui::Frame<'_>, state: &ConfigSetupView) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
-            Constraint::Min(6),
-            Constraint::Length(3),
+            Constraint::Length(4),
+            Constraint::Min(10),
+            Constraint::Length(4),
         ])
         .split(frame.area());
+    let content = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+        .split(layout[1]);
 
-    let header = Paragraph::new(format!("Select a remote for branch '{branch}'"))
-        .block(Block::default().borders(Borders::ALL).title("Push"))
-        .alignment(Alignment::Center);
+    let header = Paragraph::new(vec![
+        Line::from("Configure provider, endpoint, model, token, and commit style."),
+        Line::from(state.status_line()),
+    ])
+    .block(Block::default().borders(Borders::ALL).title("Setup"))
+    .wrap(Wrap { trim: false });
 
-    let items = remotes
+    let items = ConfigField::all()
         .iter()
-        .map(|remote| ListItem::new(remote.clone()))
+        .map(|field| ListItem::new(state.field_label(*field)))
         .collect::<Vec<_>>();
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title("Remotes"))
+        .block(Block::default().borders(Borders::ALL).title("Fields"))
         .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan))
         .highlight_symbol("> ");
 
-    let help = Paragraph::new("Up/Down move  Enter select  Esc cancel")
+    let detail: Paragraph = if matches!(state.mode, ConfigMode::Editing) {
+        Paragraph::new(state.current_editor_help())
+            .block(Block::default().borders(Borders::ALL).title("Edit Help"))
+            .wrap(Wrap { trim: false })
+    } else {
+        Paragraph::new(state.detail_text())
+            .block(Block::default().borders(Borders::ALL).title("Details"))
+            .wrap(Wrap { trim: false })
+    };
+
+    let help_text = match state.mode {
+        ConfigMode::Browsing => {
+            "Up/Down move  Left/Right cycle choices  Enter edit/select  s save  Esc cancel"
+        }
+        ConfigMode::Editing => "Type a value. Enter or Ctrl-S saves the field. Esc discards edits.",
+    };
+    let help = Paragraph::new(help_text)
         .block(Block::default().borders(Borders::ALL).title("Keys"))
-        .alignment(Alignment::Center);
+        .wrap(Wrap { trim: false });
+    let mut list_state = state.list_state.clone();
 
     frame.render_widget(header, layout[0]);
-    frame.render_stateful_widget(list, layout[1], &mut state.clone());
+    frame.render_stateful_widget(list, content[0], &mut list_state);
+
+    if matches!(state.mode, ConfigMode::Editing) {
+        frame.render_widget(&state.textarea, content[1]);
+        let (x, y) = state.textarea.cursor();
+        frame.set_cursor_position((x as u16, y as u16));
+    } else {
+        frame.render_widget(detail, content[1]);
+    }
     frame.render_widget(help, layout[2]);
 }
 
+fn draw_force_push_confirm(frame: &mut ratatui::Frame<'_>, plan: &PushPlan, error_message: &str) {
+    let message = match plan {
+        PushPlan::Upstream { branch } => format!(
+            "Normal push for '{branch}' was rejected.\n\n{error_message}\n\nPress Enter to retry with --force-with-lease, or Esc to cancel."
+        ),
+        PushPlan::SetUpstream { remote, branch } => format!(
+            "Normal push for '{branch}' to '{remote}' was rejected.\n\n{error_message}\n\nPress Enter to retry with --force-with-lease, or Esc to cancel."
+        ),
+    };
+
+    draw_message(frame, "Force Push Confirmation", &message);
+}
+
 fn draw_message(frame: &mut ratatui::Frame<'_>, title: &str, message: &str) {
-    let popup = centered_rect(70, 30, frame.area());
+    let popup = centered_rect(72, 40, frame.area());
     frame.render_widget(Clear, popup);
 
     let paragraph = Paragraph::new(message)
         .block(Block::default().borders(Borders::ALL).title(title))
-        .alignment(Alignment::Center)
+        .alignment(Alignment::Left)
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, popup);
 }
@@ -453,12 +556,6 @@ fn key_event_to_textarea_input(key: KeyEvent) -> Input {
     match key.code {
         KeyCode::Char(ch) => Input {
             key: Key::Char(ch),
-            ctrl,
-            alt,
-            shift,
-        },
-        KeyCode::Enter => Input {
-            key: Key::Enter,
             ctrl,
             alt,
             shift,
@@ -517,6 +614,12 @@ fn key_event_to_textarea_input(key: KeyEvent) -> Input {
             alt,
             shift,
         },
+        KeyCode::Enter => Input {
+            key: Key::Enter,
+            ctrl,
+            alt,
+            shift,
+        },
         _ => Input {
             key: Key::Null,
             ctrl,
@@ -531,28 +634,31 @@ struct CommitView {
     generation: GenerationState,
     mode: CommitMode,
     staged_files: Vec<String>,
-    receiver: Option<Receiver<Result<String>>>,
+    receiver: Option<Receiver<Result<Vec<String>>>>,
     generator: Option<(AiClient, PromptInput)>,
+    options: Vec<String>,
+    drafts: Vec<String>,
+    list_state: ListState,
     confirmed_message: Option<String>,
     cancelled: bool,
+    commit_style: CommitStyle,
 }
 
 impl CommitView {
-    fn new(staged_files: Vec<String>) -> Self {
-        let mut textarea = TextArea::default();
-        textarea.set_block(Block::default().borders(Borders::ALL).title("Message"));
-        textarea.set_line_number_style(Style::default().fg(Color::DarkGray));
-        textarea.set_cursor_line_style(Style::default());
-        textarea.set_placeholder_text("Generating commit message...");
+    fn new(staged_files: Vec<String>, commit_style: CommitStyle) -> Self {
         Self {
-            textarea,
+            textarea: make_textarea("Draft", "Generating commit message options..."),
             generation: GenerationState::Loading,
             mode: CommitMode::Browsing,
             staged_files,
             receiver: None,
             generator: None,
+            options: Vec::new(),
+            drafts: Vec::new(),
+            list_state: ListState::default().with_selected(Some(0)),
             confirmed_message: None,
             cancelled: false,
+            commit_style,
         }
     }
 
@@ -575,16 +681,13 @@ impl CommitView {
         self.receiver = Some(rx);
         self.generation = GenerationState::Loading;
         self.mode = CommitMode::Browsing;
-        self.textarea = TextArea::default();
-        self.textarea
-            .set_block(Block::default().borders(Borders::ALL).title("Message"));
-        self.textarea
-            .set_line_number_style(Style::default().fg(Color::DarkGray));
-        self.textarea
-            .set_placeholder_text("Generating commit message...");
+        self.options.clear();
+        self.drafts.clear();
+        self.list_state.select(Some(0));
+        self.textarea = make_textarea("Draft", "Generating commit message options...");
 
         tokio::spawn(async move {
-            let result = ai.generate_commit_message(&input).await;
+            let result = ai.generate_commit_options(&input).await;
             let _ = tx.send(result);
         });
     }
@@ -598,18 +701,16 @@ impl CommitView {
             Ok(result) => {
                 self.receiver = None;
                 match result {
-                    Ok(message) => {
-                        self.textarea =
-                            TextArea::from(message.lines().map(str::to_string).collect::<Vec<_>>());
-                        self.textarea
-                            .set_block(Block::default().borders(Borders::ALL).title("Message"));
-                        self.textarea
-                            .set_line_number_style(Style::default().fg(Color::DarkGray));
-                        self.textarea.set_placeholder_text("Edit commit message");
+                    Ok(options) => {
+                        self.options = options.clone();
+                        self.drafts = options;
+                        self.list_state.select(Some(0));
+                        self.load_selected_draft();
                         self.generation = GenerationState::Ready;
                     }
                     Err(error) => {
                         self.generation = GenerationState::Error(error.to_string());
+                        self.textarea = make_textarea("Draft", "No commit draft available");
                     }
                 }
             }
@@ -621,8 +722,41 @@ impl CommitView {
         }
     }
 
-    fn take_confirmed_message(&mut self) -> Result<Option<String>> {
-        Ok(self.confirmed_message.take())
+    fn move_selection(&mut self, delta: isize) {
+        if self.drafts.is_empty() || !matches!(self.generation, GenerationState::Ready) {
+            return;
+        }
+
+        let current = self.list_state.selected().unwrap_or(0) as isize;
+        let last = self.drafts.len().saturating_sub(1) as isize;
+        let next = (current + delta).clamp(0, last) as usize;
+        self.list_state.select(Some(next));
+        self.load_selected_draft();
+    }
+
+    fn load_selected_draft(&mut self) {
+        let Some(index) = self.list_state.selected() else {
+            return;
+        };
+        let draft = self.drafts.get(index).cloned().unwrap_or_default();
+        self.textarea = make_textarea_with_content("Draft", &draft);
+    }
+
+    fn sync_current_draft(&mut self) {
+        let current_message = self.current_message();
+        if let Some(index) = self.list_state.selected() {
+            if let Some(draft) = self.drafts.get_mut(index) {
+                *draft = current_message;
+            }
+        }
+    }
+
+    fn current_message(&self) -> String {
+        self.textarea.lines().join("\n")
+    }
+
+    fn take_confirmed_message(&mut self) -> Option<String> {
+        self.confirmed_message.take()
     }
 }
 
@@ -637,4 +771,273 @@ enum GenerationState {
 enum CommitMode {
     Browsing,
     Editing,
+}
+
+struct ConfigSetupView {
+    provider: Provider,
+    base_api_url: String,
+    base_model: String,
+    commit_style: CommitStyle,
+    pending_api_token: String,
+    token_status: TokenStatus,
+    token_present: bool,
+    mode: ConfigMode,
+    selected: usize,
+    list_state: ListState,
+    textarea: TextArea<'static>,
+    error: Option<String>,
+}
+
+impl ConfigSetupView {
+    fn new(input: ConfigSetupInput) -> Self {
+        Self {
+            provider: input.provider,
+            base_api_url: input.base_api_url,
+            base_model: input.base_model,
+            commit_style: input.commit_style,
+            pending_api_token: String::new(),
+            token_status: input.token_status,
+            token_present: input.token_present,
+            mode: ConfigMode::Browsing,
+            selected: 0,
+            list_state: ListState::default().with_selected(Some(0)),
+            textarea: make_textarea("Value", ""),
+            error: None,
+        }
+    }
+
+    fn selected_field(&self) -> ConfigField {
+        ConfigField::all()[self.selected]
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        let last = ConfigField::all().len().saturating_sub(1) as isize;
+        self.selected = (self.selected as isize + delta).clamp(0, last) as usize;
+        self.list_state.select(Some(self.selected));
+    }
+
+    fn cycle_selected(&mut self, forward: bool) {
+        match self.selected_field() {
+            ConfigField::Provider => {
+                self.provider = cycle_provider(self.provider, forward);
+                self.apply_provider_defaults();
+            }
+            ConfigField::CommitStyle => {
+                self.commit_style = cycle_commit_style(self.commit_style, forward);
+            }
+            _ => {}
+        }
+    }
+
+    fn begin_editing_selected(&mut self) {
+        let (title, value) = match self.selected_field() {
+            ConfigField::BaseApiUrl => ("BASE_API_URL", self.base_api_url.clone()),
+            ConfigField::BaseModel => ("BASE_MODEL", self.base_model.clone()),
+            ConfigField::ApiToken => ("API_TOKEN", self.pending_api_token.clone()),
+            _ => return,
+        };
+
+        self.textarea = make_textarea_with_content(title, &value);
+        self.mode = ConfigMode::Editing;
+        self.error = None;
+    }
+
+    fn finish_editing(&mut self, save: bool) -> Result<()> {
+        if save {
+            let value = self.textarea.lines().join("\n").trim().to_string();
+            match self.selected_field() {
+                ConfigField::BaseApiUrl => self.base_api_url = value,
+                ConfigField::BaseModel => self.base_model = value,
+                ConfigField::ApiToken => self.pending_api_token = value,
+                _ => bail!("cannot edit this field"),
+            }
+        }
+
+        self.mode = ConfigMode::Browsing;
+        self.error = None;
+        Ok(())
+    }
+
+    fn save(&mut self) -> Result<Option<ConfigSetupAction>> {
+        let base_api_url = normalize_base_api_url(&self.base_api_url)
+            .map_err(|error| anyhow!("BASE_API_URL: {error}"))?;
+        let base_model = self.base_model.trim();
+        if base_model.is_empty() {
+            bail!("BASE_MODEL cannot be empty");
+        }
+
+        if matches!(self.token_status, TokenStatus::Missing)
+            && !self.token_present
+            && self.pending_api_token.trim().is_empty()
+        {
+            bail!("API_TOKEN is required when no token is currently configured");
+        }
+
+        let action = ConfigSetupAction {
+            provider: self.provider,
+            base_api_url,
+            base_model: base_model.to_string(),
+            commit_style: self.commit_style,
+            api_token: if self.pending_api_token.trim().is_empty() {
+                None
+            } else {
+                Some(self.pending_api_token.trim().to_string())
+            },
+        };
+
+        Ok(Some(action))
+    }
+
+    fn field_label(&self, field: ConfigField) -> String {
+        match field {
+            ConfigField::Provider => format!("Provider: {}", self.provider),
+            ConfigField::BaseApiUrl => format!("BASE_API_URL: {}", self.base_api_url),
+            ConfigField::BaseModel => format!("BASE_MODEL: {}", self.base_model),
+            ConfigField::ApiToken => format!("API_TOKEN: {}", self.token_label()),
+            ConfigField::CommitStyle => format!("Commit Style: {}", self.commit_style),
+            ConfigField::Save => "Save".to_string(),
+            ConfigField::Cancel => "Cancel".to_string(),
+        }
+    }
+
+    fn token_label(&self) -> String {
+        if !self.pending_api_token.trim().is_empty() {
+            format!(
+                "new value staged ({} chars)",
+                self.pending_api_token.trim().chars().count()
+            )
+        } else {
+            match self.token_status {
+                TokenStatus::EnvironmentOverride => "provided by environment".to_string(),
+                TokenStatus::Keychain => "stored in keychain".to_string(),
+                TokenStatus::Missing => "(missing)".to_string(),
+            }
+        }
+    }
+
+    fn detail_text(&self) -> String {
+        if let Some(error) = &self.error {
+            return format!("Validation error:\n{error}");
+        }
+
+        match self.selected_field() {
+            ConfigField::Provider => {
+                "Choose `gemini` or `openai-compatible`. Switching provider also refreshes the default endpoint and model.".to_string()
+            }
+            ConfigField::BaseApiUrl => {
+                "Set the OpenAI-compatible base URL used for chat completions.".to_string()
+            }
+            ConfigField::BaseModel => {
+                "Set the model name sent to the provider.".to_string()
+            }
+            ConfigField::ApiToken => {
+                "Enter a new API token to store it in the system keychain. Leave it blank to keep the current token.".to_string()
+            }
+            ConfigField::CommitStyle => {
+                "Choose `standard` for plain Git subjects or `conventional` for Conventional Commits.".to_string()
+            }
+            ConfigField::Save => {
+                "Save the current settings. BASE_API_URL and BASE_MODEL are written to the config file; API_TOKEN is stored in the keychain.".to_string()
+            }
+            ConfigField::Cancel => "Exit without writing changes.".to_string(),
+        }
+    }
+
+    fn current_editor_help(&self) -> String {
+        match self.selected_field() {
+            ConfigField::BaseApiUrl => "Edit the full BASE_API_URL value.",
+            ConfigField::BaseModel => "Edit the BASE_MODEL value.",
+            ConfigField::ApiToken => "Enter a replacement API token for the keychain.",
+            _ => "Edit the selected field.",
+        }
+        .to_string()
+    }
+
+    fn status_line(&self) -> String {
+        match &self.error {
+            Some(error) => format!("Error: {error}"),
+            None => match self.token_status {
+                TokenStatus::EnvironmentOverride => {
+                    "Environment token override is active; a saved token will be ignored until it is removed.".to_string()
+                }
+                TokenStatus::Keychain => "A token is already stored in the system keychain.".to_string(),
+                TokenStatus::Missing => "No API token is currently configured.".to_string(),
+            },
+        }
+    }
+
+    fn apply_provider_defaults(&mut self) {
+        self.base_api_url = self.provider.default_base_api_url().to_string();
+        self.base_model = self.provider.default_base_model().to_string();
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ConfigMode {
+    Browsing,
+    Editing,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ConfigField {
+    Provider,
+    BaseApiUrl,
+    BaseModel,
+    ApiToken,
+    CommitStyle,
+    Save,
+    Cancel,
+}
+
+impl ConfigField {
+    fn all() -> &'static [ConfigField] {
+        &[
+            ConfigField::Provider,
+            ConfigField::BaseApiUrl,
+            ConfigField::BaseModel,
+            ConfigField::ApiToken,
+            ConfigField::CommitStyle,
+            ConfigField::Save,
+            ConfigField::Cancel,
+        ]
+    }
+}
+
+fn cycle_provider(current: Provider, forward: bool) -> Provider {
+    match (current, forward) {
+        (Provider::Gemini, true) | (Provider::OpenAiCompatible, false) => {
+            Provider::OpenAiCompatible
+        }
+        (Provider::OpenAiCompatible, true) | (Provider::Gemini, false) => Provider::Gemini,
+    }
+}
+
+fn cycle_commit_style(current: CommitStyle, forward: bool) -> CommitStyle {
+    match (current, forward) {
+        (CommitStyle::Standard, true) | (CommitStyle::Conventional, false) => {
+            CommitStyle::Conventional
+        }
+        (CommitStyle::Conventional, true) | (CommitStyle::Standard, false) => CommitStyle::Standard,
+    }
+}
+
+fn make_textarea(title: &'static str, placeholder: &'static str) -> TextArea<'static> {
+    let mut textarea = TextArea::default();
+    textarea.set_block(Block::default().borders(Borders::ALL).title(title));
+    textarea.set_line_number_style(Style::default().fg(Color::DarkGray));
+    textarea.set_cursor_line_style(Style::default());
+    textarea.set_placeholder_text(placeholder);
+    textarea
+}
+
+fn make_textarea_with_content(title: &'static str, content: &str) -> TextArea<'static> {
+    let mut textarea = if content.is_empty() {
+        TextArea::default()
+    } else {
+        TextArea::from(content.lines().map(str::to_string).collect::<Vec<_>>())
+    };
+    textarea.set_block(Block::default().borders(Borders::ALL).title(title));
+    textarea.set_line_number_style(Style::default().fg(Color::DarkGray));
+    textarea.set_cursor_line_style(Style::default());
+    textarea
 }

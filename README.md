@@ -1,14 +1,16 @@
 # Git Buddy
 
-`git-buddy` is a Rust CLI that adds a terminal UI and AI-assisted workflows on top of normal Git commands.
+`gitbuddy` is a Rust CLI that adds a terminal UI and AI-assisted workflows on top of normal Git commands.
 
 ## Features
 
-- Generate commit messages from the staged diff
-- Review and edit the suggested message before committing
+- Generate 3-5 commit message options from the staged diff
+- Choose an option in the TUI and edit it inline before committing
+- Support standard and Conventional Commits styles
 - Push the current branch to its upstream automatically
-- Choose a remote in the TUI when the first push is ambiguous
-- Use Gemini by default through an OpenAI-compatible API surface
+- Offer `--force-with-lease` only after explicit confirmation
+- Configure provider, endpoint, model, token, and commit style in one setup screen
+- Use Gemini by default, or any OpenAI-compatible provider
 - Validate local setup with a `doctor` command
 
 ## Requirements
@@ -19,23 +21,22 @@
 
 ## Configuration
 
-`git-buddy` now supports persistent global config plus secure token storage.
+`gitbuddy` supports persistent global config plus secure token storage.
 
 Recommended setup:
 
 ```bash
-cargo run -- auth login
-cargo run -- config set base-api-url https://generativelanguage.googleapis.com/v1beta/openai
-cargo run -- config set base-model gemini-2.5-flash
+cargo run --bin gitbuddy -- config
 ```
 
 What this does:
 
+- lets you choose `gemini` or `openai-compatible`
 - stores the API token in the system keychain
 - stores non-secret defaults in the standard per-user config directory
 - keeps environment variables available for one-off overrides
 
-Use `git-buddy config show` to see the exact config file path on your platform.
+Use `gitbuddy config show` to see the exact config file path on your platform.
 
 Current precedence:
 
@@ -54,26 +55,27 @@ Supported environment overrides:
 Build or run with Cargo:
 
 ```bash
-cargo run -- --help
-cargo run -- auth status
-cargo run -- config show
-cargo run -- doctor
-cargo run -- commit
-cargo run -- push
+cargo run --bin gitbuddy -- --help
+cargo run --bin gitbuddy -- config
+cargo run --bin gitbuddy -- config show
+cargo run --bin gitbuddy -- auth status
+cargo run --bin gitbuddy -- doctor
+cargo run --bin gitbuddy -- commit
+cargo run --bin gitbuddy -- push
 ```
 
 After building:
 
 ```bash
 cargo build --release
-./target/release/git-buddy
-./target/release/git-buddy commit
-./target/release/git-buddy push
+./target/release/gitbuddy
+./target/release/gitbuddy commit
+./target/release/gitbuddy push
 ```
 
 ## Command Behavior
 
-### `git-buddy`
+### `gitbuddy`
 
 Opens the home TUI and shows:
 
@@ -88,42 +90,59 @@ Keys:
 - `p` push current branch
 - `q` quit
 
-### `git-buddy commit`
+### `gitbuddy commit`
 
 - requires staged changes
-- sends the staged diff to the configured AI provider
-- shows the generated commit message in a TUI editor
+- reads the staged diff
+- asks the configured AI provider for 3-5 commit message options
+- lets you choose one option in the TUI
+- supports inline editing before commit
+- respects the configured commit style, including Conventional Commits mode
 - commits only after confirmation
 
 Keys:
 
+- `Up`/`Down` choose an option
 - `r` regenerate
 - `e` enter edit mode
 - `Enter` confirm commit
 - `Esc` cancel
 - `Ctrl-S` leave edit mode
 
-### `git-buddy push`
+### `gitbuddy push`
 
-- pushes to the configured upstream if one already exists
-- otherwise uses `origin` when available
-- otherwise uses the only remote if there is exactly one
-- otherwise shows a remote picker
+- detects the current branch
+- checks whether an upstream already exists
+- pushes immediately when the target is unambiguous
+- offers `--force-with-lease` only after explicit confirmation if the normal push is rejected
+- errors when the first push target is ambiguous instead of guessing across multiple remotes
 
-### `git-buddy doctor`
+### `gitbuddy config`
+
+- opens a setup screen by default
+- configures:
+  - provider: `gemini` or `openai-compatible`
+  - `BASE_API_URL`
+  - `BASE_MODEL`
+  - `API_TOKEN`
+  - commit style preference
+- stores non-secret settings in the config file
+- stores `API_TOKEN` in the system keychain
+
+### `gitbuddy doctor`
 
 Checks:
 
 - `git` availability
 - whether the current directory is a Git repository
 - AI token availability
-- config and override resolution
+- provider, config, and override resolution
 - reachability of `BASE_API_URL`
 
 ## Notes
 
 - Only staged changes are used to generate the commit message.
-- `git-buddy` shells out to the system `git` binary, so hooks, credentials, and your normal Git config still apply.
+- `gitbuddy` shells out to the system `git` binary, so hooks, credentials, and your normal Git config still apply.
 - Detached HEAD is rejected for commit and push flows.
 
 ## Testing

@@ -30,17 +30,8 @@ pub struct StagedChanges {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PushPlan {
-    Upstream {
-        branch: String,
-    },
-    SetUpstream {
-        remote: String,
-        branch: String,
-    },
-    ChooseRemote {
-        remotes: Vec<String>,
-        branch: String,
-    },
+    Upstream { branch: String },
+    SetUpstream { remote: String, branch: String },
 }
 
 impl GitRepo {
@@ -151,7 +142,7 @@ impl GitRepo {
     pub fn plan_push(&self) -> Result<PushPlan> {
         let branch = self.current_branch()?;
         let remotes = self.list_remotes()?;
-        Ok(resolve_push_plan(&branch, self.has_upstream(), remotes))
+        resolve_push_plan(&branch, self.has_upstream(), remotes)
     }
 
     pub fn commit(&self, message: &str) -> Result<String> {
@@ -178,13 +169,34 @@ impl GitRepo {
     }
 
     pub fn push(&self, plan: &PushPlan) -> Result<String> {
+        self.push_with_options(plan, false)
+    }
+
+    pub fn push_with_force_lease(&self, plan: &PushPlan) -> Result<String> {
+        self.push_with_options(plan, true)
+    }
+
+    fn push_with_options(&self, plan: &PushPlan, force_with_lease: bool) -> Result<String> {
         match plan {
-            PushPlan::Upstream { .. } => self.run_checked(["push"]),
-            PushPlan::SetUpstream { remote, branch } => {
-                self.run_checked(["push", "-u", remote, branch])
+            PushPlan::Upstream { .. } => {
+                if force_with_lease {
+                    self.run_checked_slice(&["push", "--force-with-lease"])
+                } else {
+                    self.run_checked(["push"])
+                }
             }
-            PushPlan::ChooseRemote { .. } => {
-                bail!("push plan requires remote selection before execution")
+            PushPlan::SetUpstream { remote, branch } => {
+                if force_with_lease {
+                    self.run_checked_slice(&[
+                        "push",
+                        "--force-with-lease",
+                        "-u",
+                        remote.as_str(),
+                        branch.as_str(),
+                    ])
+                } else {
+                    self.run_checked_slice(&["push", "-u", remote.as_str(), branch.as_str()])
+                }
             }
         }
     }
@@ -198,7 +210,20 @@ impl GitRepo {
         stringify_output(output, &format!("git {}", args.join(" ")))
     }
 
+    fn run_checked_slice(&self, args: &[&str]) -> Result<String> {
+        let output = self.run_raw_slice(args)?;
+        stringify_output(output, &format!("git {}", args.join(" ")))
+    }
+
     fn run_raw<const N: usize>(&self, args: [&str; N]) -> Result<Output> {
+        Command::new("git")
+            .current_dir(&self.cwd)
+            .args(args)
+            .output()
+            .with_context(|| format!("failed to execute git {}", args.join(" ")))
+    }
+
+    fn run_raw_slice(&self, args: &[&str]) -> Result<Output> {
         Command::new("git")
             .current_dir(&self.cwd)
             .args(args)
@@ -207,37 +232,54 @@ impl GitRepo {
     }
 }
 
-pub fn resolve_push_plan(branch: &str, has_upstream: bool, remotes: Vec<String>) -> PushPlan {
+pub fn resolve_push_plan(
+    branch: &str,
+    has_upstream: bool,
+    remotes: Vec<String>,
+) -> Result<PushPlan> {
     if has_upstream {
-        return PushPlan::Upstream {
+        return Ok(PushPlan::Upstream {
             branch: branch.to_string(),
-        };
+        });
     }
 
     if remotes.iter().any(|remote| remote == "origin") {
-        return PushPlan::SetUpstream {
+        return Ok(PushPlan::SetUpstream {
             remote: "origin".to_string(),
             branch: branch.to_string(),
-        };
+        });
     }
 
     if remotes.len() == 1 {
-        return PushPlan::SetUpstream {
+        return Ok(PushPlan::SetUpstream {
             remote: remotes[0].clone(),
             branch: branch.to_string(),
-        };
+        });
     }
 
-    PushPlan::ChooseRemote {
-        remotes,
-        branch: branch.to_string(),
+    if remotes.is_empty() {
+        bail!("no remotes found; add a remote or configure an upstream before pushing");
     }
+
+    bail!("push target is ambiguous; configure an upstream or keep a single remote named 'origin'")
+}
+
+pub fn push_needs_force_with_lease(error_message: &str) -> bool {
+    let normalized = error_message.to_ascii_lowercase();
+    normalized.contains("non-fast-forward")
+        || normalized.contains("[rejected]")
+        || normalized.contains("fetch first")
+        || normalized.contains("stale info")
 }
 
 fn stringify_output(output: Output, context: &str) -> Result<String> {
     if output.status.success() {
         let stdout = String::from_utf8(output.stdout).context("git output was not valid UTF-8")?;
-        Ok(stdout)
+        if !stdout.trim().is_empty() {
+            Ok(stdout)
+        } else {
+            Ok(String::from_utf8_lossy(&output.stderr).trim().to_string())
+        }
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -299,11 +341,11 @@ impl EmptyFallback for str {
 
 #[cfg(test)]
 mod tests {
-    use super::{PushPlan, parse_status_entry, resolve_push_plan};
+    use super::{PushPlan, parse_status_entry, push_needs_force_with_lease, resolve_push_plan};
 
     #[test]
     fn prefers_existing_upstream() {
-        let actual = resolve_push_plan("main", true, vec!["origin".into()]);
+        let actual = resolve_push_plan("main", true, vec!["origin".into()]).unwrap();
         assert_eq!(
             actual,
             PushPlan::Upstream {
@@ -314,7 +356,8 @@ mod tests {
 
     #[test]
     fn prefers_origin_for_first_push() {
-        let actual = resolve_push_plan("main", false, vec!["upstream".into(), "origin".into()]);
+        let actual =
+            resolve_push_plan("main", false, vec!["upstream".into(), "origin".into()]).unwrap();
         assert_eq!(
             actual,
             PushPlan::SetUpstream {
@@ -326,7 +369,7 @@ mod tests {
 
     #[test]
     fn uses_single_remote_without_origin() {
-        let actual = resolve_push_plan("main", false, vec!["mirror".into()]);
+        let actual = resolve_push_plan("main", false, vec!["mirror".into()]).unwrap();
         assert_eq!(
             actual,
             PushPlan::SetUpstream {
@@ -337,15 +380,10 @@ mod tests {
     }
 
     #[test]
-    fn asks_to_choose_when_ambiguous() {
-        let actual = resolve_push_plan("main", false, vec!["mirror".into(), "backup".into()]);
-        assert_eq!(
-            actual,
-            PushPlan::ChooseRemote {
-                remotes: vec!["mirror".into(), "backup".into()],
-                branch: "main".into()
-            }
-        );
+    fn rejects_ambiguous_first_push() {
+        let error =
+            resolve_push_plan("main", false, vec!["mirror".into(), "backup".into()]).unwrap_err();
+        assert!(error.to_string().contains("ambiguous"));
     }
 
     #[test]
@@ -354,5 +392,12 @@ mod tests {
         assert!(!entry.staged);
         assert!(entry.unstaged);
         assert_eq!(entry.path, "src/main.rs");
+    }
+
+    #[test]
+    fn detects_force_with_lease_rejection_text() {
+        assert!(push_needs_force_with_lease(
+            "git push failed: ! [rejected] main -> main (non-fast-forward)"
+        ));
     }
 }

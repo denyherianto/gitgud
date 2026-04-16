@@ -4,19 +4,22 @@ use anyhow::{Context, Result, anyhow, bail};
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 
-use crate::config::resolve_ai_settings;
+use crate::config::{CommitStyle, Provider, resolve_ai_settings};
 
+pub const DEFAULT_PROVIDER: Provider = Provider::Gemini;
 pub const DEFAULT_BASE_API_URL: &str = "https://generativelanguage.googleapis.com/v1beta/openai";
 pub const DEFAULT_BASE_MODEL: &str = "gemini-2.5-flash";
-const SYSTEM_PROMPT: &str = "You write concise Git commit messages. Return only the commit message. The first line must be an imperative subject under 72 characters. Optionally include a blank line and a body. Describe only the staged changes. Never use markdown fences, labels, or commentary.";
+pub const DEFAULT_COMMIT_STYLE: CommitStyle = CommitStyle::Standard;
 const DEFAULT_TIMEOUT_SECS: u64 = 20;
 const DEFAULT_MAX_DIFF_CHARS: usize = 12_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AiConfig {
     pub api_token: String,
+    pub provider: Provider,
     pub base_api_url: String,
     pub base_model: String,
+    pub commit_style: CommitStyle,
     pub timeout: Duration,
 }
 
@@ -25,12 +28,20 @@ impl AiConfig {
         let resolved = resolve_ai_settings()?;
         Self::new(
             resolved.api_token.value,
+            resolved.provider.value,
             &resolved.base_api_url.value,
             &resolved.base_model.value,
+            resolved.commit_style.value,
         )
     }
 
-    pub fn new(api_token: String, base_api_url: &str, base_model: &str) -> Result<Self> {
+    pub fn new(
+        api_token: String,
+        provider: Provider,
+        base_api_url: &str,
+        base_model: &str,
+        commit_style: CommitStyle,
+    ) -> Result<Self> {
         if api_token.trim().is_empty() {
             bail!("API_TOKEN cannot be empty");
         }
@@ -41,8 +52,10 @@ impl AiConfig {
 
         Ok(Self {
             api_token,
+            provider,
             base_api_url: normalize_base_api_url(base_api_url)?,
             base_model: base_model.trim().to_string(),
+            commit_style,
             timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
         })
     }
@@ -59,6 +72,7 @@ pub struct PromptInput {
     pub staged_files: Vec<String>,
     pub diff_stat: String,
     pub diff: String,
+    pub commit_style: CommitStyle,
 }
 
 #[derive(Debug, Clone)]
@@ -89,6 +103,14 @@ impl AiClient {
     }
 
     pub async fn generate_commit_message(&self, input: &PromptInput) -> Result<String> {
+        let mut options = self.generate_commit_options(input).await?;
+        options
+            .drain(..)
+            .next()
+            .ok_or_else(|| anyhow!("AI provider returned no commit message options"))
+    }
+
+    pub async fn generate_commit_options(&self, input: &PromptInput) -> Result<Vec<String>> {
         let endpoint = format!("{}/chat/completions", self.config.base_api_url);
         let request = ChatCompletionRequest {
             model: self.config.base_model.clone(),
@@ -96,7 +118,7 @@ impl AiClient {
             messages: vec![
                 ChatMessage {
                     role: "system".to_string(),
-                    content: SYSTEM_PROMPT.to_string(),
+                    content: build_system_prompt(input.commit_style),
                 },
                 ChatMessage {
                     role: "user".to_string(),
@@ -133,7 +155,7 @@ impl AiClient {
             .map(|choice| choice.message.content)
             .ok_or_else(|| anyhow!("AI provider returned no choices"))?;
 
-        validate_commit_message(&content)
+        parse_commit_options(&content, input.commit_style)
     }
 }
 
@@ -154,8 +176,13 @@ pub fn build_commit_prompt(input: &PromptInput) -> String {
         input.staged_files.join(", ")
     };
 
+    let style = match input.commit_style {
+        CommitStyle::Standard => "standard",
+        CommitStyle::Conventional => "conventional",
+    };
+
     format!(
-        "Branch: {}\nStaged files: {}\nDiff summary:\n{}\n\nStaged patch:\n{}",
+        "Commit style: {style}\nBranch: {}\nStaged files: {}\nDiff summary:\n{}\n\nStaged patch:\n{}",
         input.branch,
         file_list,
         if input.diff_stat.trim().is_empty() {
@@ -176,7 +203,7 @@ pub fn truncate_diff(diff: &str, max_chars: usize) -> String {
     format!("{truncated}\n\n[diff truncated]")
 }
 
-pub fn validate_commit_message(raw: &str) -> Result<String> {
+pub fn validate_commit_message(raw: &str, commit_style: CommitStyle) -> Result<String> {
     let normalized = raw.replace("\r\n", "\n");
     let lines: Vec<String> = normalized
         .lines()
@@ -202,6 +229,10 @@ pub fn validate_commit_message(raw: &str) -> Result<String> {
         bail!("commit message subject exceeds 72 characters");
     }
 
+    if matches!(commit_style, CommitStyle::Conventional) {
+        validate_conventional_subject(subject)?;
+    }
+
     let body_lines = lines[1..]
         .iter()
         .skip_while(|line| line.is_empty())
@@ -215,6 +246,99 @@ pub fn validate_commit_message(raw: &str) -> Result<String> {
     };
 
     Ok(message)
+}
+
+fn build_system_prompt(commit_style: CommitStyle) -> String {
+    let style_rules = match commit_style {
+        CommitStyle::Standard => {
+            "Use standard commit messages with an imperative subject under 72 characters."
+        }
+        CommitStyle::Conventional => {
+            "Use Conventional Commits. Every subject must match type(scope optional)!: description."
+        }
+    };
+
+    format!(
+        "You write concise Git commit messages. Return valid JSON only with this shape: {{\"options\":[\"message 1\",\"message 2\",\"message 3\"]}}. Provide 3 to 5 distinct options. Each option may include a blank line and body, but no markdown fences, labels, numbering, or commentary. Describe only the staged changes. {style_rules}"
+    )
+}
+
+fn parse_commit_options(raw: &str, commit_style: CommitStyle) -> Result<Vec<String>> {
+    let parsed = parse_options_payload(raw)?;
+    if !(3..=5).contains(&parsed.options.len()) {
+        bail!("AI provider must return between 3 and 5 commit message options");
+    }
+
+    let mut options = Vec::with_capacity(parsed.options.len());
+    for option in parsed.options {
+        options.push(validate_commit_message(&option, commit_style)?);
+    }
+
+    Ok(options)
+}
+
+fn parse_options_payload(raw: &str) -> Result<CommitOptionsPayload> {
+    let json = raw.trim();
+
+    if let Ok(parsed) = serde_json::from_str::<CommitOptionsPayload>(json) {
+        return Ok(parsed);
+    }
+
+    if let Some(stripped) = strip_code_fence(json) {
+        return serde_json::from_str::<CommitOptionsPayload>(stripped)
+            .context("failed to parse commit options JSON");
+    }
+
+    Err(anyhow!("failed to parse commit options JSON"))
+}
+
+fn strip_code_fence(raw: &str) -> Option<&str> {
+    let stripped = raw.strip_prefix("```")?;
+    let stripped = stripped
+        .strip_prefix("json")
+        .or_else(|| stripped.strip_prefix("JSON"))
+        .unwrap_or(stripped);
+    let stripped = stripped.strip_prefix('\n').unwrap_or(stripped);
+    stripped.strip_suffix("```").map(str::trim)
+}
+
+fn validate_conventional_subject(subject: &str) -> Result<()> {
+    let (head, description) = subject
+        .split_once(": ")
+        .ok_or_else(|| anyhow!("conventional commit subject must contain ': '"))?;
+    if description.trim().is_empty() {
+        bail!("conventional commit description cannot be empty");
+    }
+
+    let head = head.strip_suffix('!').unwrap_or(head);
+    let (commit_type, scope) = if let Some((commit_type, remainder)) = head.split_once('(') {
+        let scope = remainder
+            .strip_suffix(')')
+            .ok_or_else(|| anyhow!("conventional commit scope must end with ')'"))?;
+        (commit_type, Some(scope))
+    } else {
+        (head, None)
+    };
+
+    if commit_type.is_empty()
+        || !commit_type
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch == '-')
+    {
+        bail!("conventional commit type must use lowercase ASCII letters or hyphens");
+    }
+
+    if let Some(scope) = scope {
+        if scope.is_empty()
+            || !scope
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '/' || ch == '_')
+        {
+            bail!("conventional commit scope contains unsupported characters");
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
@@ -245,14 +369,20 @@ struct ChatResponseMessage {
     content: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct CommitOptionsPayload {
+    options: Vec<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
     use super::{
-        AiConfig, DEFAULT_BASE_API_URL, build_commit_prompt, normalize_base_api_url, truncate_diff,
-        validate_commit_message,
+        AiConfig, DEFAULT_BASE_API_URL, build_commit_prompt, normalize_base_api_url,
+        parse_commit_options, truncate_diff, validate_commit_message,
     };
+    use crate::config::{CommitStyle, Provider};
 
     #[test]
     fn normalizes_base_url() {
@@ -262,20 +392,29 @@ mod tests {
 
     #[test]
     fn rejects_empty_model() {
-        let error = AiConfig::new("token".into(), DEFAULT_BASE_API_URL, "   ").unwrap_err();
+        let error = AiConfig::new(
+            "token".into(),
+            Provider::Gemini,
+            DEFAULT_BASE_API_URL,
+            "   ",
+            CommitStyle::Standard,
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("BASE_MODEL"));
     }
 
     #[test]
     fn trims_body_spacing() {
-        let actual = validate_commit_message("Add TUI flow\n\nRefine navigation\n").unwrap();
+        let actual =
+            validate_commit_message("Add TUI flow\n\nRefine navigation\n", CommitStyle::Standard)
+                .unwrap();
         assert_eq!(actual, "Add TUI flow\n\nRefine navigation");
     }
 
     #[test]
     fn rejects_long_subject() {
         let subject = "a".repeat(73);
-        let error = validate_commit_message(&subject).unwrap_err();
+        let error = validate_commit_message(&subject, CommitStyle::Standard).unwrap_err();
         assert!(error.to_string().contains("72"));
     }
 
@@ -294,18 +433,48 @@ mod tests {
             staged_files: vec!["src/main.rs".into()],
             diff_stat: "1 file changed".into(),
             diff: "diff --git".into(),
+            commit_style: CommitStyle::Standard,
         });
 
         assert!(prompt.contains("Branch: main"));
+        assert!(prompt.contains("Commit style: standard"));
         assert!(prompt.contains("src/main.rs"));
         assert!(prompt.contains("1 file changed"));
     }
 
     #[test]
     fn supports_test_timeout_override() {
-        let config = AiConfig::new("token".into(), DEFAULT_BASE_API_URL, "model")
-            .unwrap()
-            .with_timeout(Duration::from_secs(1));
+        let config = AiConfig::new(
+            "token".into(),
+            Provider::Gemini,
+            DEFAULT_BASE_API_URL,
+            "model",
+            CommitStyle::Standard,
+        )
+        .unwrap()
+        .with_timeout(Duration::from_secs(1));
         assert_eq!(config.timeout, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn parses_commit_options_json() {
+        let options = parse_commit_options(
+            r#"{"options":["Add TUI flow","Improve push logic","Refine config screen"]}"#,
+            CommitStyle::Standard,
+        )
+        .unwrap();
+
+        assert_eq!(options.len(), 3);
+    }
+
+    #[test]
+    fn validates_conventional_commit_subjects() {
+        let message = validate_commit_message(
+            "feat(cli): add multiple commit message options",
+            CommitStyle::Conventional,
+        )
+        .unwrap();
+
+        assert_eq!(message, "feat(cli): add multiple commit message options");
     }
 }

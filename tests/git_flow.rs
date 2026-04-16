@@ -120,7 +120,7 @@ fn plans_first_push_to_single_non_origin_remote() {
 }
 
 #[test]
-fn requires_remote_choice_when_multiple_remotes_exist() {
+fn rejects_ambiguous_first_push_when_multiple_remotes_exist() {
     let bare_a = TempDir::new().unwrap();
     let bare_b = TempDir::new().unwrap();
     run(bare_a.path(), &["init", "--bare"]);
@@ -136,14 +136,8 @@ fn requires_remote_choice_when_multiple_remotes_exist() {
     );
 
     let repo = GitRepo::new(repo_dir.path());
-    let plan = repo.plan_push().unwrap();
-    assert_eq!(
-        plan,
-        PushPlan::ChooseRemote {
-            remotes: vec!["backup".into(), "mirror".into()],
-            branch: "main".into()
-        }
-    );
+    let error = repo.plan_push().unwrap_err();
+    assert!(error.to_string().contains("ambiguous"));
 }
 
 #[test]
