@@ -449,11 +449,7 @@ fn draw_commit(frame: &mut ratatui::Frame<'_>, state: &CommitView) {
         .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan))
         .highlight_symbol("> ");
 
-    let help_text = match state.mode {
-        CommitMode::Browsing => "Up/Down select  e edit  r regenerate  Enter commit  Esc cancel",
-        CommitMode::Editing => "Edit draft inline. Ctrl-S or Esc returns to browse mode.",
-    };
-    let help = Paragraph::new(help_text)
+    let help = Paragraph::new(build_commit_help_line(state))
         .block(Block::default().borders(Borders::ALL).title("Keys"))
         .alignment(Alignment::Center);
     let mut list_state = state.list_state.clone();
@@ -467,6 +463,34 @@ fn draw_commit(frame: &mut ratatui::Frame<'_>, state: &CommitView) {
     if matches!(state.mode, CommitMode::Editing) {
         let (x, y) = state.textarea.cursor();
         frame.set_cursor_position((x as u16, y as u16));
+    }
+}
+
+fn build_commit_help_line(state: &CommitView) -> Line<'static> {
+    let key_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+
+    match state.mode {
+        CommitMode::Browsing => Line::from(vec![
+            Span::styled("Up/Down", key_style),
+            Span::raw(" select  "),
+            Span::styled("e", key_style),
+            Span::raw(" edit  "),
+            Span::styled("r", key_style),
+            Span::raw(" regenerate  "),
+            Span::styled("Enter", key_style),
+            Span::raw(" commit  "),
+            Span::styled("Esc", key_style),
+            Span::raw(" cancel"),
+        ]),
+        CommitMode::Editing => Line::from(vec![
+            Span::raw("Edit draft inline. "),
+            Span::styled("Ctrl-S", key_style),
+            Span::raw(" or "),
+            Span::styled("Esc", key_style),
+            Span::raw(" returns to browse mode."),
+        ]),
     }
 }
 
