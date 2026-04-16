@@ -1,0 +1,158 @@
+use std::{fs, path::Path, process::Command};
+
+use git_buddy::git::{GitRepo, PushPlan};
+use tempfile::TempDir;
+
+fn run(dir: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run git {:?}: {error}", args));
+
+    if !output.status.success() {
+        panic!(
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    String::from_utf8(output.stdout).unwrap()
+}
+
+fn init_repo() -> TempDir {
+    let temp = TempDir::new().unwrap();
+    run(temp.path(), &["init", "-b", "main"]);
+    run(temp.path(), &["config", "user.name", "Test User"]);
+    run(temp.path(), &["config", "user.email", "test@example.com"]);
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    run(temp.path(), &["add", "README.md"]);
+    run(temp.path(), &["commit", "-m", "Initial commit"]);
+    temp
+}
+
+#[test]
+fn commits_staged_changes() {
+    let repo_dir = init_repo();
+    fs::write(repo_dir.path().join("README.md"), "hello\nworld\n").unwrap();
+    run(repo_dir.path(), &["add", "README.md"]);
+
+    let repo = GitRepo::new(repo_dir.path());
+    let output = repo.commit("Update README").unwrap();
+    assert!(output.contains("Update README"));
+
+    let log = run(repo_dir.path(), &["log", "-1", "--pretty=%s"]);
+    assert_eq!(log.trim(), "Update README");
+}
+
+#[test]
+fn reports_no_staged_changes() {
+    let repo_dir = init_repo();
+    let repo = GitRepo::new(repo_dir.path());
+    let staged = repo.staged_changes().unwrap();
+
+    assert!(staged.staged_files.is_empty());
+    assert!(staged.diff.trim().is_empty());
+}
+
+#[test]
+fn plans_push_to_existing_upstream() {
+    let bare = TempDir::new().unwrap();
+    run(bare.path(), &["init", "--bare"]);
+    let repo_dir = init_repo();
+    run(
+        repo_dir.path(),
+        &["remote", "add", "origin", bare.path().to_str().unwrap()],
+    );
+    run(repo_dir.path(), &["push", "-u", "origin", "main"]);
+
+    let repo = GitRepo::new(repo_dir.path());
+    let plan = repo.plan_push().unwrap();
+    assert_eq!(
+        plan,
+        PushPlan::Upstream {
+            branch: "main".into()
+        }
+    );
+}
+
+#[test]
+fn plans_first_push_to_origin() {
+    let bare = TempDir::new().unwrap();
+    run(bare.path(), &["init", "--bare"]);
+    let repo_dir = init_repo();
+    run(
+        repo_dir.path(),
+        &["remote", "add", "origin", bare.path().to_str().unwrap()],
+    );
+
+    let repo = GitRepo::new(repo_dir.path());
+    let plan = repo.plan_push().unwrap();
+    assert_eq!(
+        plan,
+        PushPlan::SetUpstream {
+            remote: "origin".into(),
+            branch: "main".into()
+        }
+    );
+}
+
+#[test]
+fn plans_first_push_to_single_non_origin_remote() {
+    let bare = TempDir::new().unwrap();
+    run(bare.path(), &["init", "--bare"]);
+    let repo_dir = init_repo();
+    run(
+        repo_dir.path(),
+        &["remote", "add", "mirror", bare.path().to_str().unwrap()],
+    );
+
+    let repo = GitRepo::new(repo_dir.path());
+    let plan = repo.plan_push().unwrap();
+    assert_eq!(
+        plan,
+        PushPlan::SetUpstream {
+            remote: "mirror".into(),
+            branch: "main".into()
+        }
+    );
+}
+
+#[test]
+fn requires_remote_choice_when_multiple_remotes_exist() {
+    let bare_a = TempDir::new().unwrap();
+    let bare_b = TempDir::new().unwrap();
+    run(bare_a.path(), &["init", "--bare"]);
+    run(bare_b.path(), &["init", "--bare"]);
+    let repo_dir = init_repo();
+    run(
+        repo_dir.path(),
+        &["remote", "add", "mirror", bare_a.path().to_str().unwrap()],
+    );
+    run(
+        repo_dir.path(),
+        &["remote", "add", "backup", bare_b.path().to_str().unwrap()],
+    );
+
+    let repo = GitRepo::new(repo_dir.path());
+    let plan = repo.plan_push().unwrap();
+    assert_eq!(
+        plan,
+        PushPlan::ChooseRemote {
+            remotes: vec!["backup".into(), "mirror".into()],
+            branch: "main".into()
+        }
+    );
+}
+
+#[test]
+fn detects_detached_head_for_push() {
+    let repo_dir = init_repo();
+    let head = run(repo_dir.path(), &["rev-parse", "HEAD"]);
+    run(repo_dir.path(), &["checkout", head.trim()]);
+
+    let repo = GitRepo::new(repo_dir.path());
+    let error = repo.plan_push().unwrap_err();
+    assert!(error.to_string().contains("detached HEAD"));
+}
