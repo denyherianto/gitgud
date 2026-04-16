@@ -29,7 +29,6 @@ use crate::{
 
 type Backend = CrosstermBackend<Stdout>;
 type AppTerminal = Terminal<Backend>;
-const MAX_STAGED_TREE_LINES: usize = 6;
 
 pub enum HomeAction {
     Commit,
@@ -229,6 +228,30 @@ fn handle_commit_browsing_key(state: &mut CommitView, key: KeyEvent) -> Result<b
             state.move_selection(1);
             Ok(false)
         }
+        KeyCode::Left => {
+            state.scroll_staged(-1);
+            Ok(false)
+        }
+        KeyCode::Right => {
+            state.scroll_staged(1);
+            Ok(false)
+        }
+        KeyCode::PageUp => {
+            state.scroll_staged(-8);
+            Ok(false)
+        }
+        KeyCode::PageDown => {
+            state.scroll_staged(8);
+            Ok(false)
+        }
+        KeyCode::Home => {
+            state.scroll_staged_to_start();
+            Ok(false)
+        }
+        KeyCode::End => {
+            state.scroll_staged_to_end();
+            Ok(false)
+        }
         KeyCode::Char('r') => {
             state.restart_generation()?;
             Ok(false)
@@ -390,18 +413,22 @@ fn draw_commit(frame: &mut ratatui::Frame<'_>, state: &CommitView) {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(34), Constraint::Percentage(66)])
         .split(layout[1]);
-    let tree_lines = staged_files_tree_lines(&state.staged_files, MAX_STAGED_TREE_LINES);
-    let tree_height = tree_lines.len() as u16 + 2;
     let sidebar = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(tree_height), Constraint::Min(6)])
+        .constraints([Constraint::Fill(3), Constraint::Fill(2)])
         .split(content[0]);
+    let tree_lines = staged_files_tree_lines(&state.staged_files);
 
     let status_block = Paragraph::new(status_lines)
         .block(Block::default().borders(Borders::ALL).title("Commit"))
         .wrap(Wrap { trim: false });
-    let staged_files = Paragraph::new(tree_lines.join("\n"))
-        .block(Block::default().borders(Borders::ALL).title("Staged"))
+    let staged_files = Paragraph::new(tree_lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!("Staged Tree ({})", state.staged_files.len())),
+        )
+        .scroll((state.staged_scroll as u16, 0))
         .wrap(Wrap { trim: false });
 
     let options = if state.options.is_empty() {
@@ -453,13 +480,14 @@ fn build_commit_status_lines(state: &CommitView) -> Vec<Line<'static>> {
     vec![
         Line::from(format!("Style: {}", state.commit_style)),
         Line::from(format!("Staged count: {}", state.staged_files.len())),
+        Line::from("Left/Right scroll staged tree  PgUp/PgDn jump  Home/End edges"),
         Line::from(status_text.to_string()),
     ]
 }
 
-fn staged_files_tree_lines(staged_files: &[String], max_lines: usize) -> Vec<String> {
+fn staged_files_tree_lines(staged_files: &[String]) -> Vec<Line<'static>> {
     if staged_files.is_empty() {
-        return vec!["(none)".to_string()];
+        return vec![Line::from("(none)")];
     }
 
     let mut root = FileTreeNode::default();
@@ -469,13 +497,6 @@ fn staged_files_tree_lines(staged_files: &[String], max_lines: usize) -> Vec<Str
 
     let mut lines = Vec::new();
     root.render(String::new(), &mut lines);
-
-    if lines.len() > max_lines {
-        let hidden = lines.len() - max_lines;
-        lines.truncate(max_lines);
-        lines.push(format!("... and {hidden} more"));
-    }
-
     lines
 }
 
@@ -706,6 +727,7 @@ struct CommitView {
     options: Vec<String>,
     drafts: Vec<String>,
     list_state: ListState,
+    staged_scroll: usize,
     confirmed_message: Option<String>,
     cancelled: bool,
     commit_style: CommitStyle,
@@ -723,6 +745,7 @@ impl CommitView {
             options: Vec::new(),
             drafts: Vec::new(),
             list_state: ListState::default().with_selected(Some(0)),
+            staged_scroll: 0,
             confirmed_message: None,
             cancelled: false,
             commit_style,
@@ -751,6 +774,7 @@ impl CommitView {
         self.options.clear();
         self.drafts.clear();
         self.list_state.select(Some(0));
+        self.staged_scroll = 0;
         self.textarea = make_textarea("Draft", "Generating commit message options...");
 
         tokio::spawn(async move {
@@ -824,6 +848,23 @@ impl CommitView {
 
     fn take_confirmed_message(&mut self) -> Option<String> {
         self.confirmed_message.take()
+    }
+
+    fn scroll_staged(&mut self, delta: isize) {
+        let total_lines = staged_files_tree_lines(&self.staged_files).len();
+        let max_scroll = total_lines.saturating_sub(1) as isize;
+        let next = (self.staged_scroll as isize + delta).clamp(0, max_scroll) as usize;
+        self.staged_scroll = next;
+    }
+
+    fn scroll_staged_to_start(&mut self) {
+        self.staged_scroll = 0;
+    }
+
+    fn scroll_staged_to_end(&mut self) {
+        self.staged_scroll = staged_files_tree_lines(&self.staged_files)
+            .len()
+            .saturating_sub(1);
     }
 }
 
@@ -1122,12 +1163,26 @@ impl FileTreeNode {
         }
     }
 
-    fn render(&self, prefix: String, lines: &mut Vec<String>) {
+    fn render(&self, prefix: String, lines: &mut Vec<Line<'static>>) {
         let len = self.children.len();
         for (index, (name, child)) in self.children.iter().enumerate() {
             let is_last = index + 1 == len;
             let connector = if is_last { "`-- " } else { "|-- " };
-            lines.push(format!("{prefix}{connector}{name}"));
+            let is_file = child.children.is_empty();
+            let icon = if is_file { "f " } else { "d " };
+            let name_style = if is_file {
+                Style::default().fg(Color::White)
+            } else {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(prefix.clone(), Style::default().fg(Color::DarkGray)),
+                Span::styled(connector, Style::default().fg(Color::DarkGray)),
+                Span::styled(icon, Style::default().fg(Color::Yellow)),
+                Span::styled(name.clone(), name_style),
+            ]));
 
             let child_prefix = format!("{prefix}{}", if is_last { "    " } else { "|   " });
             child.render(child_prefix, lines);
@@ -1139,42 +1194,49 @@ impl FileTreeNode {
 mod tests {
     use super::staged_files_tree_lines;
 
+    fn plain_text(lines: Vec<ratatui::text::Line<'static>>) -> Vec<String> {
+        lines
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .into_iter()
+                    .map(|span| span.content.to_string())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
     #[test]
     fn renders_staged_files_as_tree() {
-        let lines = staged_files_tree_lines(
-            &[
-                "src/tui.rs".to_string(),
-                "src/app.rs".to_string(),
-                "tests/git_flow.rs".to_string(),
-            ],
-            10,
-        );
+        let lines = plain_text(staged_files_tree_lines(&[
+            "src/tui.rs".to_string(),
+            "src/app.rs".to_string(),
+            "tests/git_flow.rs".to_string(),
+        ]));
 
         assert_eq!(
             lines,
             vec![
-                "|-- src".to_string(),
-                "|   |-- app.rs".to_string(),
-                "|   `-- tui.rs".to_string(),
-                "`-- tests".to_string(),
-                "    `-- git_flow.rs".to_string(),
+                "|-- d src".to_string(),
+                "|   |-- f app.rs".to_string(),
+                "|   `-- f tui.rs".to_string(),
+                "`-- d tests".to_string(),
+                "    `-- f git_flow.rs".to_string(),
             ]
         );
     }
 
     #[test]
-    fn truncates_long_staged_file_tree() {
-        let lines = staged_files_tree_lines(
-            &[
-                "a.rs".to_string(),
-                "b.rs".to_string(),
-                "c.rs".to_string(),
-                "d.rs".to_string(),
-            ],
-            2,
-        );
+    fn keeps_all_staged_files_in_tree() {
+        let lines = plain_text(staged_files_tree_lines(&[
+            "a.rs".to_string(),
+            "b.rs".to_string(),
+            "c.rs".to_string(),
+            "d.rs".to_string(),
+        ]));
 
-        assert_eq!(lines.len(), 3);
-        assert_eq!(lines[2], "... and 2 more");
+        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[0], "|-- f a.rs");
+        assert_eq!(lines[3], "`-- f d.rs");
     }
 }
