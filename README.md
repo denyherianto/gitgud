@@ -6,6 +6,28 @@
   <img src="./assets/gitgud-mascot.jpg" alt="gitgud repo mascot" width="280">
 </p>
 
+## Install
+
+Install the latest GitHub release:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/denyherianto/gitgud/main/install.sh | sh
+```
+
+Install a specific release:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/denyherianto/gitgud/main/install.sh | sh -s -- --version v0.1.0
+```
+
+The installer expects GitHub release assets named like:
+
+- `gg-darwin-arm64.tar.gz`
+- `gg-darwin-x86_64.tar.gz`
+- `gg-linux-arm64.tar.gz`
+- `gg-linux-x86_64.tar.gz`
+- `gg-windows-x86_64.zip`
+
 ## Features
 
 - Generate 1-3 commit message options from the staged diff
@@ -153,27 +175,6 @@ cargo build --release
 ./target/release/gg push
 ./target/release/gg ask "undo last commit but keep changes"
 ```
-
-## Install
-
-Install the latest GitHub release:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/denyherianto/gitgud/main/install.sh | sh
-```
-
-Install a specific release:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/denyherianto/gitgud/main/install.sh | sh -s -- --version v0.1.0
-```
-
-The installer expects GitHub release assets named like:
-
-- `gg-darwin-arm64.tar.gz`
-- `gg-darwin-x86_64.tar.gz`
-- `gg-linux-arm64.tar.gz`
-- `gg-linux-x86_64.tar.gz`
 
 ## Command Behavior
 
