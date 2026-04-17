@@ -926,6 +926,7 @@ fn draw_config_setup(frame: &mut ratatui::Frame<'_>, state: &ConfigSetupView) {
         .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan))
         .highlight_symbol("> ");
 
+    let detail_scroll = state.detail_scroll_offset(content[1].height);
     let detail: Paragraph = if matches!(state.mode, ConfigMode::Editing) {
         Paragraph::new(state.current_editor_help())
             .block(Block::default().borders(Borders::ALL).title("Edit Help"))
@@ -933,12 +934,13 @@ fn draw_config_setup(frame: &mut ratatui::Frame<'_>, state: &ConfigSetupView) {
     } else {
         Paragraph::new(state.detail_text())
             .block(Block::default().borders(Borders::ALL).title("Details"))
+            .scroll((detail_scroll, 0))
             .wrap(Wrap { trim: false })
     };
 
     let help_text = match state.mode {
         ConfigMode::Browsing => {
-            "Up/Down move  Left/Right cycle choices  Enter edit/select/load  e manual edit  s save  Esc cancel/close picker"
+            "Up/Down move or scroll picker  Left/Right cycle choices  Enter edit/select/load  e manual edit  s save  Esc cancel/close picker"
         }
         ConfigMode::Editing => "Type a value. Enter or Ctrl-S saves the field. Esc discards edits.",
     };
@@ -1367,6 +1369,8 @@ struct ConfigSetupView {
     error: Option<String>,
 }
 
+const MODEL_DETAIL_HEADER_LINES: usize = 4;
+
 impl ConfigSetupView {
     fn new(input: ConfigSetupInput) -> Self {
         let model_options = if can_load_model_options(
@@ -1575,7 +1579,7 @@ impl ConfigSetupView {
                 "Loading model options from the configured provider.".to_string()
             }
             None if self.model_picker_active => {
-                "Model picker active. Up/Down moves the highlight, Enter applies the model, Esc closes the picker.".to_string()
+                "Model picker active. Up/Down moves and scrolls the list, Enter applies the model, Esc closes the picker.".to_string()
             }
             None => {
                 if matches!(self.generation_mode, GenerationMode::HeuristicOnly) {
@@ -1761,6 +1765,36 @@ impl ConfigSetupView {
         }
     }
 
+    fn detail_scroll_offset(&self, detail_height: u16) -> u16 {
+        let ModelOptionsState::Loaded(models) = &self.model_options else {
+            return 0;
+        };
+
+        let viewport_lines = detail_height.saturating_sub(2) as usize;
+        if models.is_empty() || viewport_lines == 0 {
+            return 0;
+        }
+
+        let total_lines = MODEL_DETAIL_HEADER_LINES + models.len();
+        if total_lines <= viewport_lines {
+            return 0;
+        }
+
+        let focus_index = if self.model_picker_active {
+            self.model_highlighted.min(models.len().saturating_sub(1))
+        } else {
+            models
+                .iter()
+                .position(|model| model == &self.base_model)
+                .unwrap_or(0)
+        };
+        let focus_line = MODEL_DETAIL_HEADER_LINES + focus_index;
+        let max_scroll = total_lines.saturating_sub(viewport_lines);
+        let desired_scroll = focus_line.saturating_sub(viewport_lines.saturating_sub(1));
+
+        desired_scroll.min(max_scroll) as u16
+    }
+
     fn base_model_suffix(&self) -> &'static str {
         match self.model_options {
             ModelOptionsState::Unavailable => " (fill URL + API token to load options)",
@@ -1787,9 +1821,9 @@ impl ConfigSetupView {
                 let mut lines = vec![
                     format!("Loaded {} model option(s).", models.len()),
                     if self.model_picker_active {
-                        "Up/Down moves the highlighted model. Enter applies it. Esc closes the picker. Press `e` for manual model input.".to_string()
+                        "Newest models are listed first. Up/Down moves the highlight and scrolls the list. Enter applies it. Esc closes the picker. Press `e` for manual model input.".to_string()
                     } else {
-                        "Press Enter to open the picker, then use Up/Down to choose a model. Press `e` for manual model input.".to_string()
+                        "Newest models are listed first. Press Enter to open the picker, then use Up/Down to choose a model. Press `e` for manual model input.".to_string()
                     },
                     String::new(),
                     "Available models:".to_string(),
@@ -2111,6 +2145,20 @@ mod tests {
         assert!(matches!(action, ConfigSetupLoopAction::Continue));
         assert_eq!(state.model_highlighted, 1);
         assert_eq!(state.base_model, "gemini-2.5-flash");
+    }
+
+    #[test]
+    fn model_picker_scrolls_to_keep_highlight_visible() {
+        let mut state = ConfigSetupView::new(setup_input());
+        state.model_options = ModelOptionsState::Loaded(
+            (0..8)
+                .map(|index| format!("model-{index}"))
+                .collect::<Vec<_>>(),
+        );
+        state.model_picker_active = true;
+        state.model_highlighted = 6;
+
+        assert_eq!(state.detail_scroll_offset(8), 5);
     }
 
     #[test]

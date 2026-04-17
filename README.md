@@ -108,7 +108,7 @@ Interactive setup supports:
 - `API_TOKEN`
 - commit style: `standard` or `conventional`
 - generation mode: `auto`, `ai-only`, or `heuristic-only`
-- provider model loading from `/models` after `BASE_API_URL` and `API_TOKEN` are set
+- provider model loading from `/models` after `BASE_API_URL` and `API_TOKEN` are set, sorted newest-first when the provider returns creation timestamps, with a scrollable picker for long lists
 
 Use `gg config show` to print the exact config path and the source of each effective value.
 

@@ -335,13 +335,7 @@ pub async fn fetch_model_options(base_api_url: &str, api_token: &str) -> Result<
 
     let parsed: ModelListResponse =
         serde_json::from_str(&body).context("failed to parse AI model list response JSON")?;
-    let mut models = Vec::new();
-    for model in parsed.data {
-        let id = model.id.trim();
-        if !id.is_empty() && !models.iter().any(|existing| existing == id) {
-            models.push(id.to_string());
-        }
-    }
+    let models = collect_model_options(parsed.data);
 
     if models.is_empty() {
         bail!("AI provider returned no models");
@@ -1500,6 +1494,26 @@ fn sentence_case(raw: &str) -> String {
     result
 }
 
+fn collect_model_options(payloads: Vec<ModelPayload>) -> Vec<String> {
+    let mut payloads = payloads.into_iter().enumerate().collect::<Vec<_>>();
+    payloads.sort_by(|(left_index, left), (right_index, right)| {
+        right
+            .created
+            .cmp(&left.created)
+            .then_with(|| left_index.cmp(right_index))
+    });
+
+    let mut models = Vec::new();
+    for (_, model) in payloads {
+        let id = model.id.trim();
+        if !id.is_empty() && !models.iter().any(|existing| existing == id) {
+            models.push(id.to_string());
+        }
+    }
+
+    models
+}
+
 #[derive(Debug, Serialize)]
 struct ChatCompletionRequest {
     model: String,
@@ -1567,6 +1581,8 @@ struct ModelListResponse {
 #[derive(Debug, Deserialize)]
 struct ModelPayload {
     id: String,
+    #[serde(default)]
+    created: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1614,13 +1630,13 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        AiConfig, AskContext, AskSuggestion, DEFAULT_BASE_API_URL, DiffExplanation,
+        AiConfig, AskContext, AskSuggestion, DEFAULT_BASE_API_URL, DiffExplanation, ModelPayload,
         SplitCommitPlan, SuggestedCommand, build_ask_user_prompt, build_commit_prompt,
         build_diff_explanation_prompt, build_heuristic_commit_options,
-        build_heuristic_commit_suggestions, normalize_base_api_url, parse_ask_suggestion,
-        parse_commit_options, parse_commit_suggestions, parse_commit_suggestions_with_preset,
-        parse_diff_explanation, truncate_diff, validate_commit_message,
-        validate_commit_message_with_preset,
+        build_heuristic_commit_suggestions, collect_model_options, normalize_base_api_url,
+        parse_ask_suggestion, parse_commit_options, parse_commit_suggestions,
+        parse_commit_suggestions_with_preset, parse_diff_explanation, truncate_diff,
+        validate_commit_message, validate_commit_message_with_preset,
     };
     use crate::config::{CommitStyle, GenerationMode, Provider, ResolvedConventionalPreset};
 
@@ -1735,6 +1751,30 @@ mod tests {
         .unwrap()
         .with_timeout(Duration::from_secs(1));
         assert_eq!(config.timeout, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn sorts_models_newest_first_and_deduplicates_ids() {
+        let models = collect_model_options(vec![
+            ModelPayload {
+                id: "gpt-4.1-mini".to_string(),
+                created: Some(10),
+            },
+            ModelPayload {
+                id: "gpt-4.1".to_string(),
+                created: Some(20),
+            },
+            ModelPayload {
+                id: "gpt-4.1-mini".to_string(),
+                created: Some(10),
+            },
+            ModelPayload {
+                id: "gpt-4o".to_string(),
+                created: Some(30),
+            },
+        ]);
+
+        assert_eq!(models, vec!["gpt-4o", "gpt-4.1", "gpt-4.1-mini"]);
     }
 
     #[test]

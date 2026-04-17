@@ -310,13 +310,15 @@ async fn lists_models_from_provider() {
         .mock("GET", "/models")
         .match_header("authorization", "Bearer token")
         .with_status(200)
-        .with_body(r#"{"data":[{"id":"gpt-4.1-mini"},{"id":"gpt-4.1"},{"id":"gpt-4.1-mini"}]}"#)
+        .with_body(
+            r#"{"data":[{"id":"gpt-4.1-mini","created":10},{"id":"gpt-4.1","created":20},{"id":"gpt-4.1-mini","created":10},{"id":"gpt-4o","created":30}]}"#,
+        )
         .create_async()
         .await;
 
     let models = fetch_model_options(&server.url(), "token").await.unwrap();
 
-    assert_eq!(models, vec!["gpt-4.1-mini", "gpt-4.1"]);
+    assert_eq!(models, vec!["gpt-4o", "gpt-4.1", "gpt-4.1-mini"]);
 }
 
 #[tokio::test]
