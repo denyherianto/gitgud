@@ -20,13 +20,13 @@
 Latest release:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/denyherianto/gitgud/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/denyherianto/gitgud/master/install.sh | sh
 ```
 
 Specific release:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/denyherianto/gitgud/main/install.sh | sh -s -- --version v0.1.0
+curl -fsSL https://raw.githubusercontent.com/denyherianto/gitgud/master/install.sh | sh -s -- --version v0.1.0
 ```
 
 Requirements:
