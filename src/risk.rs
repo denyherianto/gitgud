@@ -67,9 +67,7 @@ pub fn classify_risk(command: &str) -> RiskLevel {
         }
         "rebase" => {
             let is_main_target = args.iter().any(|a| {
-                matches!(*a, "main" | "master")
-                    || a.ends_with("/main")
-                    || a.ends_with("/master")
+                matches!(*a, "main" | "master") || a.ends_with("/main") || a.ends_with("/master")
             });
             if is_main_target {
                 RiskLevel::Dangerous
@@ -112,7 +110,10 @@ mod tests {
 
     #[test]
     fn classifies_reset_hard_as_dangerous() {
-        assert_eq!(classify_risk("git reset --hard HEAD~1"), RiskLevel::Dangerous);
+        assert_eq!(
+            classify_risk("git reset --hard HEAD~1"),
+            RiskLevel::Dangerous
+        );
         assert_eq!(classify_risk("reset --hard"), RiskLevel::Dangerous);
     }
 
@@ -126,12 +127,18 @@ mod tests {
     fn classifies_force_push_as_dangerous() {
         assert_eq!(classify_risk("git push --force"), RiskLevel::Dangerous);
         assert_eq!(classify_risk("git push -f"), RiskLevel::Dangerous);
-        assert_eq!(classify_risk("git push origin main --force"), RiskLevel::Dangerous);
+        assert_eq!(
+            classify_risk("git push origin main --force"),
+            RiskLevel::Dangerous
+        );
     }
 
     #[test]
     fn classifies_force_with_lease_as_medium() {
-        assert_eq!(classify_risk("git push --force-with-lease"), RiskLevel::Medium);
+        assert_eq!(
+            classify_risk("git push --force-with-lease"),
+            RiskLevel::Medium
+        );
     }
 
     #[test]
@@ -148,12 +155,18 @@ mod tests {
 
     #[test]
     fn classifies_branch_force_delete_as_dangerous() {
-        assert_eq!(classify_risk("git branch -D feature-branch"), RiskLevel::Dangerous);
+        assert_eq!(
+            classify_risk("git branch -D feature-branch"),
+            RiskLevel::Dangerous
+        );
     }
 
     #[test]
     fn classifies_branch_soft_delete_as_safe() {
-        assert_eq!(classify_risk("git branch -d feature-branch"), RiskLevel::Safe);
+        assert_eq!(
+            classify_risk("git branch -d feature-branch"),
+            RiskLevel::Safe
+        );
         assert_eq!(classify_risk("git branch --list"), RiskLevel::Safe);
     }
 
@@ -171,12 +184,18 @@ mod tests {
     fn classifies_rebase_main_as_dangerous() {
         assert_eq!(classify_risk("git rebase main"), RiskLevel::Dangerous);
         assert_eq!(classify_risk("git rebase master"), RiskLevel::Dangerous);
-        assert_eq!(classify_risk("git rebase origin/main"), RiskLevel::Dangerous);
+        assert_eq!(
+            classify_risk("git rebase origin/main"),
+            RiskLevel::Dangerous
+        );
     }
 
     #[test]
     fn classifies_rebase_feature_as_medium() {
-        assert_eq!(classify_risk("git rebase feature-branch"), RiskLevel::Medium);
+        assert_eq!(
+            classify_risk("git rebase feature-branch"),
+            RiskLevel::Medium
+        );
         assert_eq!(classify_risk("git rebase -i HEAD~3"), RiskLevel::Medium);
     }
 

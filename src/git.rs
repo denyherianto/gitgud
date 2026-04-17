@@ -258,7 +258,10 @@ impl GitRepo {
 
         let args: Vec<&str> = stripped.split_whitespace().collect();
         if args.is_empty() {
-            bail!("suggested command has no arguments after 'git': {}", command);
+            bail!(
+                "suggested command has no arguments after 'git': {}",
+                command
+            );
         }
 
         self.run_checked_slice(&args)

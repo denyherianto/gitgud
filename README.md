@@ -39,7 +39,7 @@ The installer expects GitHub release assets named like:
 - Push the current branch to its upstream automatically
 - Offer `--force-with-lease` only after explicit confirmation
 - **Ask questions in natural language** — describe what you want to do and get exact Git command(s) with risk ratings, explanations, and alternatives
-- Configure provider, endpoint, model, token, and commit style in one setup screen
+- Configure provider, endpoint, token, model, and commit style in one setup screen
 - Load provider model options in setup after entering a base URL and API token
 - Use Gemini by default, or any OpenAI-compatible provider
 - Pass through normal Git commands like `status`, `log`, `diff`, and `branch`
@@ -55,7 +55,7 @@ The installer expects GitHub release assets named like:
 | `gg explain` | Explain the staged diff: what changed, likely intent, risk areas, and test suggestions |
 | `gg push` | Push the current branch; offers `--force-with-lease` only after explicit confirmation |
 | `gg ask <query>` | Describe what you want in plain English and get exact Git command(s) with risk ratings and alternatives |
-| `gg config` | Open the interactive setup screen to configure provider, model, token, and commit style |
+| `gg config` | Open the interactive setup screen to configure provider, token, model, and commit style |
 | `gg config show` | Print the resolved configuration and its sources |
 | `gg config set <key> <value>` | Set a single config value (e.g. `commit-style`, `generation-mode`, `conventional-preset`) |
 | `gg config unset <key>` | Remove a config value and fall back to the default |
@@ -301,9 +301,9 @@ Keys:
 - configures:
   - provider: `gemini` or `openai-compatible`
   - `BASE_API_URL`
+  - `API_TOKEN`
   - `BASE_MODEL`
     Load available model options with `Enter`, navigate them with `Up`/`Down`, and apply one with `Enter` after `BASE_API_URL` and `API_TOKEN` are filled, or press `e` to type a custom model manually
-  - `API_TOKEN`
   - commit style preference
   - commit generation mode: `auto`, `ai-only`, or `heuristic-only`
   - active Conventional Commit preset selection

@@ -221,11 +221,7 @@ fn dangerous_command_loop(
     }
 }
 
-fn draw_ask(
-    frame: &mut ratatui::Frame<'_>,
-    suggestion: &AskSuggestion,
-    risk_levels: &[RiskLevel],
-) {
+fn draw_ask(frame: &mut ratatui::Frame<'_>, suggestion: &AskSuggestion, risk_levels: &[RiskLevel]) {
     let area = frame.area();
 
     // Build recommended lines
@@ -302,7 +298,10 @@ fn draw_ask(
 
     let explain_lines: Vec<Line<'static>> = vec![
         Line::from(vec![
-            Span::styled("Explanation: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "Explanation: ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
             Span::raw(suggestion.explanation.clone()),
         ]),
         Line::from(""),
@@ -1842,8 +1841,8 @@ enum ModelOptionsState {
 enum ConfigField {
     Provider,
     BaseApiUrl,
-    BaseModel,
     ApiToken,
+    BaseModel,
     CommitStyle,
     GenerationMode,
     Save,
@@ -1855,8 +1854,8 @@ impl ConfigField {
         &[
             ConfigField::Provider,
             ConfigField::BaseApiUrl,
-            ConfigField::BaseModel,
             ConfigField::ApiToken,
+            ConfigField::BaseModel,
             ConfigField::CommitStyle,
             ConfigField::GenerationMode,
             ConfigField::Save,
@@ -1976,7 +1975,7 @@ impl FileTreeNode {
 #[cfg(test)]
 mod tests {
     use super::{
-        CommitMode, CommitView, ConfigMode, ConfigSetupInput, ConfigSetupLoopAction,
+        CommitMode, CommitView, ConfigField, ConfigMode, ConfigSetupInput, ConfigSetupLoopAction,
         ConfigSetupView, GenerationState, ModelOptionsState, build_commit_status_lines,
         can_load_model_options, handle_config_browsing_key, staged_files_tree_lines,
     };
@@ -2021,6 +2020,13 @@ mod tests {
             token_status: TokenStatus::Keychain,
             token_present: true,
         }
+    }
+
+    fn field_index(field: ConfigField) -> usize {
+        ConfigField::all()
+            .iter()
+            .position(|candidate| *candidate == field)
+            .expect("field should exist in config field list")
     }
 
     #[test]
@@ -2076,7 +2082,7 @@ mod tests {
     #[test]
     fn enter_opens_model_picker() {
         let mut state = ConfigSetupView::new(setup_input());
-        state.selected = 2;
+        state.selected = field_index(ConfigField::BaseModel);
         state.model_options = ModelOptionsState::Loaded(vec![
             "gemini-2.5-flash".to_string(),
             "gpt-4.1-mini".to_string(),
@@ -2093,7 +2099,7 @@ mod tests {
     #[test]
     fn down_moves_model_picker_highlight() {
         let mut state = ConfigSetupView::new(setup_input());
-        state.selected = 2;
+        state.selected = field_index(ConfigField::BaseModel);
         state.model_options = ModelOptionsState::Loaded(vec![
             "gemini-2.5-flash".to_string(),
             "gpt-4.1-mini".to_string(),
@@ -2110,7 +2116,7 @@ mod tests {
     #[test]
     fn enter_applies_highlighted_model() {
         let mut state = ConfigSetupView::new(setup_input());
-        state.selected = 2;
+        state.selected = field_index(ConfigField::BaseModel);
         state.model_options = ModelOptionsState::Loaded(vec![
             "gemini-2.5-flash".to_string(),
             "gpt-4.1-mini".to_string(),
@@ -2129,7 +2135,7 @@ mod tests {
     #[test]
     fn esc_closes_model_picker_before_canceling_setup() {
         let mut state = ConfigSetupView::new(setup_input());
-        state.selected = 2;
+        state.selected = field_index(ConfigField::BaseModel);
         state.model_options = ModelOptionsState::Loaded(vec![
             "gemini-2.5-flash".to_string(),
             "gpt-4.1-mini".to_string(),
