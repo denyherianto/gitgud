@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use gitgud::ai::{AiClient, AiConfig, DiffExplanation, PromptInput};
+use gitgud::ai::{AiClient, AiConfig, DiffExplanation, PromptInput, fetch_model_options};
 use gitgud::config::{CommitStyle, GenerationMode, Provider, ResolvedConventionalPreset};
 use mockito::{Matcher, Server};
 
@@ -301,4 +301,38 @@ async fn ai_only_surfaces_timeout_without_fallback() {
             .downcast_ref::<reqwest::Error>()
             .is_some_and(reqwest::Error::is_timeout)
     }));
+}
+
+#[tokio::test]
+async fn lists_models_from_provider() {
+    let mut server = Server::new_async().await;
+    let _mock = server
+        .mock("GET", "/models")
+        .match_header("authorization", "Bearer token")
+        .with_status(200)
+        .with_body(r#"{"data":[{"id":"gpt-4.1-mini"},{"id":"gpt-4.1"},{"id":"gpt-4.1-mini"}]}"#)
+        .create_async()
+        .await;
+
+    let models = fetch_model_options(&server.url(), "token").await.unwrap();
+
+    assert_eq!(models, vec!["gpt-4.1-mini", "gpt-4.1"]);
+}
+
+#[tokio::test]
+async fn surfaces_model_listing_errors() {
+    let mut server = Server::new_async().await;
+    let _mock = server
+        .mock("GET", "/models")
+        .with_status(401)
+        .with_body("unauthorized")
+        .create_async()
+        .await;
+
+    let error = fetch_model_options(&server.url(), "token")
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("listing models"));
+    assert!(error.to_string().contains("401"));
 }

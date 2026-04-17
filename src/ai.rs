@@ -134,6 +134,10 @@ impl AiClient {
         Ok(response.status().as_u16())
     }
 
+    pub async fn list_models(&self) -> Result<Vec<String>> {
+        fetch_model_options(&self.config.base_api_url, &self.config.api_token).await
+    }
+
     pub async fn generate_commit_message(&self, input: &PromptInput) -> Result<String> {
         let mut options = self.generate_commit_options(input).await?;
         options
@@ -253,6 +257,56 @@ impl AiClient {
             .map(|choice| choice.message.content)
             .ok_or_else(|| anyhow!("AI provider returned no choices"))
     }
+}
+
+pub async fn fetch_model_options(base_api_url: &str, api_token: &str) -> Result<Vec<String>> {
+    let api_token = api_token.trim();
+    if api_token.is_empty() {
+        bail!("API_TOKEN cannot be empty");
+    }
+
+    let endpoint = format!("{}/models", normalize_base_api_url(base_api_url)?);
+    let client = Client::builder()
+        .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
+        .build()
+        .context("failed to build HTTP client")?;
+
+    let response = client
+        .get(endpoint)
+        .bearer_auth(api_token)
+        .send()
+        .await
+        .context("failed to call AI provider model list endpoint")?;
+
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .context("failed to read AI model list response")?;
+
+    if !status.is_success() {
+        bail!(
+            "AI provider returned {} while listing models: {}",
+            status,
+            body.trim()
+        );
+    }
+
+    let parsed: ModelListResponse =
+        serde_json::from_str(&body).context("failed to parse AI model list response JSON")?;
+    let mut models = Vec::new();
+    for model in parsed.data {
+        let id = model.id.trim();
+        if !id.is_empty() && !models.iter().any(|existing| existing == id) {
+            models.push(id.to_string());
+        }
+    }
+
+    if models.is_empty() {
+        bail!("AI provider returned no models");
+    }
+
+    Ok(models)
 }
 
 pub fn normalize_base_api_url(raw: &str) -> Result<String> {
@@ -1367,6 +1421,17 @@ struct DiffExplanationPayload {
     possible_intent: Vec<String>,
     risk_areas: Vec<String>,
     test_suggestions: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelListResponse {
+    #[serde(default)]
+    data: Vec<ModelPayload>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelPayload {
+    id: String,
 }
 
 #[derive(Debug, Deserialize)]

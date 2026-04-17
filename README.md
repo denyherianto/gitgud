@@ -17,6 +17,7 @@
 - Push the current branch to its upstream automatically
 - Offer `--force-with-lease` only after explicit confirmation
 - Configure provider, endpoint, model, token, and commit style in one setup screen
+- Load provider model options in setup after entering a base URL and API token
 - Use Gemini by default, or any OpenAI-compatible provider
 - Pass through normal Git commands like `status`, `log`, `diff`, and `branch`
 - Validate local setup with a `doctor` command
@@ -40,6 +41,7 @@ cargo run --bin gg -- config
 What this does:
 
 - lets you choose `gemini` or `openai-compatible`
+- lets you open provider-reported model options with `Enter`, navigate them with `Up`/`Down`, and apply one with `Enter` after `BASE_API_URL` and `API_TOKEN` are available
 - lets you choose `auto`, `ai-only`, or `heuristic-only` commit generation
 - stores the API token in the system keychain
 - stores non-secret defaults in the standard per-user config directory
@@ -234,6 +236,7 @@ Keys:
   - provider: `gemini` or `openai-compatible`
   - `BASE_API_URL`
   - `BASE_MODEL`
+    Load available model options with `Enter`, navigate them with `Up`/`Down`, and apply one with `Enter` after `BASE_API_URL` and `API_TOKEN` are filled, or press `e` to type a custom model manually
   - `API_TOKEN`
   - commit style preference
   - commit generation mode: `auto`, `ai-only`, or `heuristic-only`

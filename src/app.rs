@@ -8,9 +8,9 @@ use crate::{
     ai::{AiClient, AiConfig, DiffExplanation, PromptInput},
     cli::{AuthCommand, Cli, Command, ConfigCommand},
     config::{
-        GenerationMode, TokenStatus, config_path, delete_api_token, load_file, resolve_ai_settings,
-        resolve_non_secret_settings, save_file_to_path, set_config_value, store_api_token,
-        token_status, unset_config_value,
+        GenerationMode, TokenStatus, config_path, delete_api_token, load_api_token, load_file,
+        resolve_ai_settings, resolve_non_secret_settings, save_file_to_path, set_config_value,
+        store_api_token, token_status, unset_config_value,
     },
     git::{GitRepo, push_needs_force_with_lease},
     tui::{self, CommitAction, ConfigSetupAction, ConfigSetupInput, HomeAction},
@@ -339,12 +339,18 @@ fn run_config_setup() -> Result<()> {
     let path = config_path()?;
     let resolved = resolve_non_secret_settings()?;
     let current_token_status = token_status()?;
+    let existing_api_token = env::var("API_TOKEN")
+        .ok()
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty())
+        .or(load_api_token()?);
     let input = ConfigSetupInput {
         provider: resolved.provider.value,
         base_api_url: resolved.base_api_url.value,
         base_model: resolved.base_model.value,
         commit_style: resolved.commit_style.value,
         generation_mode: resolved.generation_mode.value,
+        existing_api_token,
         token_status: current_token_status.clone(),
         token_present: !matches!(current_token_status, TokenStatus::Missing),
     };

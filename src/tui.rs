@@ -24,7 +24,7 @@ use tui_textarea::{Input, Key, TextArea};
 use crate::{
     ai::{
         AiClient, CommitSuggestions, PromptInput, SplitCommitPlan,
-        build_heuristic_commit_suggestions, normalize_base_api_url,
+        build_heuristic_commit_suggestions, fetch_model_options, normalize_base_api_url,
         validate_commit_message_with_preset,
     },
     config::{CommitStyle, GenerationMode, Provider, ResolvedConventionalPreset, TokenStatus},
@@ -59,6 +59,7 @@ pub struct ConfigSetupInput {
     pub base_model: String,
     pub commit_style: CommitStyle,
     pub generation_mode: GenerationMode,
+    pub existing_api_token: Option<String>,
     pub token_status: TokenStatus,
     pub token_present: bool,
 }
@@ -202,6 +203,7 @@ fn config_setup_loop(
     state: &mut ConfigSetupView,
 ) -> Result<Option<ConfigSetupAction>> {
     loop {
+        state.poll_model_options();
         terminal.draw(|frame| draw_config_setup(frame, state))?;
 
         if !event::poll(Duration::from_millis(100))? {
@@ -210,11 +212,11 @@ fn config_setup_loop(
 
         if let Event::Key(key) = event::read()? {
             match state.mode {
-                ConfigMode::Browsing => {
-                    if let Some(action) = handle_config_browsing_key(state, key)? {
-                        return Ok(Some(action));
-                    }
-                }
+                ConfigMode::Browsing => match handle_config_browsing_key(state, key)? {
+                    ConfigSetupLoopAction::Continue => {}
+                    ConfigSetupLoopAction::Submit(action) => return Ok(Some(action)),
+                    ConfigSetupLoopAction::Cancel => return Ok(None),
+                },
                 ConfigMode::Editing => handle_config_editing_key(state, key)?,
             }
         }
@@ -379,35 +381,54 @@ fn handle_commit_editing_key(state: &mut CommitView, key: KeyEvent) {
 fn handle_config_browsing_key(
     state: &mut ConfigSetupView,
     key: KeyEvent,
-) -> Result<Option<ConfigSetupAction>> {
+) -> Result<ConfigSetupLoopAction> {
     match key.code {
-        KeyCode::Up => state.move_selection(-1),
-        KeyCode::Down => state.move_selection(1),
+        KeyCode::Up => {
+            if state.selected_field() == ConfigField::BaseModel && state.model_picker_active {
+                state.move_model_highlight(-1);
+            } else {
+                state.move_selection(-1);
+            }
+        }
+        KeyCode::Down => {
+            if state.selected_field() == ConfigField::BaseModel && state.model_picker_active {
+                state.move_model_highlight(1);
+            } else {
+                state.move_selection(1);
+            }
+        }
         KeyCode::Left => state.cycle_selected(false),
         KeyCode::Right => state.cycle_selected(true),
         KeyCode::Char('e') => state.begin_editing_selected(),
         KeyCode::Char('s') => match state.save() {
-            Ok(action) => return Ok(action),
+            Ok(Some(action)) => return Ok(ConfigSetupLoopAction::Submit(action)),
+            Ok(None) => return Ok(ConfigSetupLoopAction::Continue),
             Err(error) => state.error = Some(error.to_string()),
         },
         KeyCode::Enter => match state.selected_field() {
             ConfigField::Provider | ConfigField::CommitStyle | ConfigField::GenerationMode => {
                 state.cycle_selected(true)
             }
-            ConfigField::BaseApiUrl | ConfigField::BaseModel | ConfigField::ApiToken => {
-                state.begin_editing_selected()
-            }
+            ConfigField::BaseApiUrl | ConfigField::ApiToken => state.begin_editing_selected(),
+            ConfigField::BaseModel => state.open_or_apply_model_picker(),
             ConfigField::Save => match state.save() {
-                Ok(action) => return Ok(action),
+                Ok(Some(action)) => return Ok(ConfigSetupLoopAction::Submit(action)),
+                Ok(None) => return Ok(ConfigSetupLoopAction::Continue),
                 Err(error) => state.error = Some(error.to_string()),
             },
-            ConfigField::Cancel => return Ok(None),
+            ConfigField::Cancel => return Ok(ConfigSetupLoopAction::Cancel),
         },
-        KeyCode::Esc => return Ok(None),
+        KeyCode::Esc => {
+            if state.selected_field() == ConfigField::BaseModel && state.model_picker_active {
+                state.close_model_picker();
+            } else {
+                return Ok(ConfigSetupLoopAction::Cancel);
+            }
+        }
         _ => {}
     }
 
-    Ok(None)
+    Ok(ConfigSetupLoopAction::Continue)
 }
 
 fn handle_config_editing_key(state: &mut ConfigSetupView, key: KeyEvent) -> Result<()> {
@@ -696,7 +717,7 @@ fn draw_config_setup(frame: &mut ratatui::Frame<'_>, state: &ConfigSetupView) {
 
     let help_text = match state.mode {
         ConfigMode::Browsing => {
-            "Up/Down move  Left/Right cycle choices  Enter edit/select  s save  Esc cancel"
+            "Up/Down move  Left/Right cycle choices  Enter edit/select/load  e manual edit  s save  Esc cancel/close picker"
         }
         ConfigMode::Editing => "Type a value. Enter or Ctrl-S saves the field. Esc discards edits.",
     };
@@ -1110,9 +1131,14 @@ struct ConfigSetupView {
     base_model: String,
     commit_style: CommitStyle,
     generation_mode: GenerationMode,
+    existing_api_token: Option<String>,
     pending_api_token: String,
     token_status: TokenStatus,
     token_present: bool,
+    model_options: ModelOptionsState,
+    model_options_receiver: Option<Receiver<Result<Vec<String>>>>,
+    model_picker_active: bool,
+    model_highlighted: usize,
     mode: ConfigMode,
     selected: usize,
     list_state: ListState,
@@ -1122,15 +1148,30 @@ struct ConfigSetupView {
 
 impl ConfigSetupView {
     fn new(input: ConfigSetupInput) -> Self {
+        let model_options = if can_load_model_options(
+            &input.base_api_url,
+            input.existing_api_token.as_deref(),
+            None,
+        ) {
+            ModelOptionsState::Idle
+        } else {
+            ModelOptionsState::Unavailable
+        };
+
         Self {
             provider: input.provider,
             base_api_url: input.base_api_url,
             base_model: input.base_model,
             commit_style: input.commit_style,
             generation_mode: input.generation_mode,
+            existing_api_token: input.existing_api_token,
             pending_api_token: String::new(),
             token_status: input.token_status,
             token_present: input.token_present,
+            model_options,
+            model_options_receiver: None,
+            model_picker_active: false,
+            model_highlighted: 0,
             mode: ConfigMode::Browsing,
             selected: 0,
             list_state: ListState::default().with_selected(Some(0)),
@@ -1167,12 +1208,13 @@ impl ConfigSetupView {
 
     fn begin_editing_selected(&mut self) {
         let (title, value) = match self.selected_field() {
-            ConfigField::BaseApiUrl => ("BASE_API_URL", self.base_api_url.clone()),
-            ConfigField::BaseModel => ("BASE_MODEL", self.base_model.clone()),
-            ConfigField::ApiToken => ("API_TOKEN", self.pending_api_token.clone()),
+            ConfigField::BaseApiUrl => ("Base API URL", self.base_api_url.clone()),
+            ConfigField::BaseModel => ("Model", self.base_model.clone()),
+            ConfigField::ApiToken => ("API Token", self.pending_api_token.clone()),
             _ => return,
         };
 
+        self.model_picker_active = false;
         self.textarea = make_textarea_with_content(title, &value);
         self.mode = ConfigMode::Editing;
         self.error = None;
@@ -1182,9 +1224,15 @@ impl ConfigSetupView {
         if save {
             let value = self.textarea.lines().join("\n").trim().to_string();
             match self.selected_field() {
-                ConfigField::BaseApiUrl => self.base_api_url = value,
+                ConfigField::BaseApiUrl => {
+                    self.base_api_url = value;
+                    self.reset_model_options();
+                }
                 ConfigField::BaseModel => self.base_model = value,
-                ConfigField::ApiToken => self.pending_api_token = value,
+                ConfigField::ApiToken => {
+                    self.pending_api_token = value;
+                    self.reset_model_options();
+                }
                 _ => bail!("cannot edit this field"),
             }
         }
@@ -1229,9 +1277,11 @@ impl ConfigSetupView {
     fn field_label(&self, field: ConfigField) -> String {
         match field {
             ConfigField::Provider => format!("Provider: {}", self.provider),
-            ConfigField::BaseApiUrl => format!("BASE_API_URL: {}", self.base_api_url),
-            ConfigField::BaseModel => format!("BASE_MODEL: {}", self.base_model),
-            ConfigField::ApiToken => format!("API_TOKEN: {}", self.token_label()),
+            ConfigField::BaseApiUrl => format!("Base API URL: {}", self.base_api_url),
+            ConfigField::BaseModel => {
+                format!("Model: {}{}", self.base_model, self.base_model_suffix())
+            }
+            ConfigField::ApiToken => format!("API Token: {}", self.token_label()),
             ConfigField::CommitStyle => format!("Commit Style: {}", self.commit_style),
             ConfigField::GenerationMode => {
                 format!("Generation Mode: {}", self.generation_mode)
@@ -1268,9 +1318,7 @@ impl ConfigSetupView {
             ConfigField::BaseApiUrl => {
                 "Set the OpenAI-compatible base URL used for chat completions.".to_string()
             }
-            ConfigField::BaseModel => {
-                "Set the model name sent to the provider.".to_string()
-            }
+            ConfigField::BaseModel => self.base_model_detail_text(),
             ConfigField::ApiToken => {
                 "Enter a new API token to store it in the system keychain. Leave it blank to keep the current token.".to_string()
             }
@@ -1281,7 +1329,7 @@ impl ConfigSetupView {
                 "Choose `auto` to use AI with timeout fallback, `ai-only` to require the provider, or `heuristic-only` to skip AI and use local suggestions.".to_string()
             }
             ConfigField::Save => {
-                "Save the current settings. BASE_API_URL and BASE_MODEL are written to the config file; API_TOKEN is stored in the keychain.".to_string()
+                "Save the current settings. Base API URL and Model are written to the config file; API Token is stored in the keychain.".to_string()
             }
             ConfigField::Cancel => "Exit without writing changes.".to_string(),
         }
@@ -1289,9 +1337,11 @@ impl ConfigSetupView {
 
     fn current_editor_help(&self) -> String {
         match self.selected_field() {
-            ConfigField::BaseApiUrl => "Edit the full BASE_API_URL value.",
-            ConfigField::BaseModel => "Edit the BASE_MODEL value.",
-            ConfigField::ApiToken => "Enter a replacement API token for the keychain.",
+            ConfigField::BaseApiUrl => "Edit the full Base API URL value.",
+            ConfigField::BaseModel => {
+                "Edit the Model value manually. In browsing mode, press Enter to open the provider model picker and Enter again to apply the highlighted model."
+            }
+            ConfigField::ApiToken => "Enter a replacement API Token for the keychain.",
             _ => "Edit the selected field.",
         }
         .to_string()
@@ -1300,6 +1350,12 @@ impl ConfigSetupView {
     fn status_line(&self) -> String {
         match &self.error {
             Some(error) => format!("Error: {error}"),
+            None if matches!(self.model_options, ModelOptionsState::Loading) => {
+                "Loading model options from the configured provider.".to_string()
+            }
+            None if self.model_picker_active => {
+                "Model picker active. Up/Down moves the highlight, Enter applies the model, Esc closes the picker.".to_string()
+            }
             None => {
                 if matches!(self.generation_mode, GenerationMode::HeuristicOnly) {
                     "Heuristic-only mode skips the AI provider for commit suggestions.".to_string()
@@ -1321,6 +1377,221 @@ impl ConfigSetupView {
     fn apply_provider_defaults(&mut self) {
         self.base_api_url = self.provider.default_base_api_url().to_string();
         self.base_model = self.provider.default_base_model().to_string();
+        self.reset_model_options();
+    }
+
+    fn effective_api_token(&self) -> Option<String> {
+        let pending = self.pending_api_token.trim();
+        if !pending.is_empty() {
+            return Some(pending.to_string());
+        }
+
+        self.existing_api_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+            .map(str::to_string)
+    }
+
+    fn reset_model_options(&mut self) {
+        self.model_options_receiver = None;
+        self.model_picker_active = false;
+        self.model_highlighted = 0;
+        self.model_options = if can_load_model_options(
+            &self.base_api_url,
+            self.existing_api_token.as_deref(),
+            Some(self.pending_api_token.as_str()),
+        ) {
+            ModelOptionsState::Idle
+        } else {
+            ModelOptionsState::Unavailable
+        };
+    }
+
+    fn poll_model_options(&mut self) {
+        let Some(receiver) = &self.model_options_receiver else {
+            return;
+        };
+
+        match receiver.try_recv() {
+            Ok(result) => {
+                self.model_options_receiver = None;
+                match result {
+                    Ok(models) => {
+                        self.model_highlighted = models
+                            .iter()
+                            .position(|model| model == &self.base_model)
+                            .unwrap_or(0);
+                        self.model_options = ModelOptionsState::Loaded(models);
+                    }
+                    Err(error) => {
+                        self.model_picker_active = false;
+                        self.model_options = ModelOptionsState::Error(error.to_string());
+                    }
+                }
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.model_options_receiver = None;
+                self.model_picker_active = false;
+                self.model_options =
+                    ModelOptionsState::Error("model loading task disconnected".to_string());
+            }
+        }
+    }
+
+    fn open_or_apply_model_picker(&mut self) {
+        self.error = None;
+
+        if !can_load_model_options(
+            &self.base_api_url,
+            self.existing_api_token.as_deref(),
+            Some(self.pending_api_token.as_str()),
+        ) {
+            self.model_options = ModelOptionsState::Unavailable;
+            self.error = Some(
+                "Fill BASE_API_URL and API_TOKEN before loading provider model options."
+                    .to_string(),
+            );
+            return;
+        }
+
+        match &self.model_options {
+            ModelOptionsState::Loaded(models) => {
+                if models.is_empty() {
+                    self.model_options =
+                        ModelOptionsState::Error("AI provider returned no models".to_string());
+                    return;
+                }
+                if self.model_picker_active {
+                    self.apply_highlighted_model();
+                } else {
+                    self.model_picker_active = true;
+                    self.model_highlighted = models
+                        .iter()
+                        .position(|model| model == &self.base_model)
+                        .unwrap_or(0);
+                }
+            }
+            ModelOptionsState::Loading => {}
+            ModelOptionsState::Idle
+            | ModelOptionsState::Unavailable
+            | ModelOptionsState::Error(_) => {
+                self.model_picker_active = true;
+                self.load_model_options();
+            }
+        }
+    }
+
+    fn load_model_options(&mut self) {
+        let Some(api_token) = self.effective_api_token() else {
+            self.model_options = ModelOptionsState::Unavailable;
+            self.error = Some(
+                "Fill BASE_API_URL and API_TOKEN before loading provider model options."
+                    .to_string(),
+            );
+            return;
+        };
+
+        let base_api_url = self.base_api_url.clone();
+        let (tx, rx) = mpsc::channel();
+        self.model_options = ModelOptionsState::Loading;
+        self.model_options_receiver = Some(rx);
+        self.error = None;
+
+        tokio::spawn(async move {
+            let result = fetch_model_options(&base_api_url, &api_token).await;
+            let _ = tx.send(result);
+        });
+    }
+
+    fn move_model_highlight(&mut self, delta: isize) {
+        let ModelOptionsState::Loaded(models) = &self.model_options else {
+            return;
+        };
+        if models.is_empty() {
+            return;
+        }
+
+        self.model_picker_active = true;
+        let len = models.len() as isize;
+        let current = self.model_highlighted.min(models.len().saturating_sub(1)) as isize;
+        let next = (current + delta).clamp(0, len - 1) as usize;
+        self.model_highlighted = next;
+    }
+
+    fn apply_highlighted_model(&mut self) {
+        let ModelOptionsState::Loaded(models) = &self.model_options else {
+            return;
+        };
+        if let Some(model) = models.get(self.model_highlighted) {
+            self.base_model = model.clone();
+        }
+        self.model_picker_active = false;
+    }
+
+    fn close_model_picker(&mut self) {
+        self.model_picker_active = false;
+        if let ModelOptionsState::Loaded(models) = &self.model_options {
+            self.model_highlighted = models
+                .iter()
+                .position(|model| model == &self.base_model)
+                .unwrap_or(0);
+        }
+    }
+
+    fn base_model_suffix(&self) -> &'static str {
+        match self.model_options {
+            ModelOptionsState::Unavailable => " (fill URL + API token to load options)",
+            ModelOptionsState::Idle => " (press Enter to open options)",
+            ModelOptionsState::Loading => " (loading options...)",
+            ModelOptionsState::Loaded(_) if self.model_picker_active => " (picker active)",
+            ModelOptionsState::Loaded(_) => " (press Enter to open picker)",
+            ModelOptionsState::Error(_) => " (press Enter to retry)",
+        }
+    }
+
+    fn base_model_detail_text(&self) -> String {
+        match &self.model_options {
+            ModelOptionsState::Unavailable => {
+                "Fill `BASE_API_URL` and `API_TOKEN` first, then press Enter on this row to load provider model options. Press `e` to enter a custom model manually.".to_string()
+            }
+            ModelOptionsState::Idle => {
+                "Press Enter on this row to load provider model options, then use Up/Down on the right-panel picker and Enter to apply one. Press `e` to enter a custom model manually.".to_string()
+            }
+            ModelOptionsState::Loading => {
+                "Loading model options from the configured provider. Wait for the request to finish, then use Up/Down on the right-panel picker and Enter to apply one.".to_string()
+            }
+            ModelOptionsState::Loaded(models) => {
+                let mut lines = vec![
+                    format!("Loaded {} model option(s).", models.len()),
+                    if self.model_picker_active {
+                        "Up/Down moves the highlighted model. Enter applies it. Esc closes the picker. Press `e` for manual model input.".to_string()
+                    } else {
+                        "Press Enter to open the picker, then use Up/Down to choose a model. Press `e` for manual model input.".to_string()
+                    },
+                    String::new(),
+                    "Available models:".to_string(),
+                ];
+                lines.extend(models.iter().enumerate().map(|(index, model)| {
+                    let marker = if self.model_picker_active && index == self.model_highlighted {
+                        ">"
+                    } else {
+                        " "
+                    };
+                    let suffix = if model == &self.base_model {
+                        " (current)"
+                    } else {
+                        ""
+                    };
+                    format!("{marker} {model}{suffix}")
+                }));
+                lines.join("\n")
+            }
+            ModelOptionsState::Error(error) => format!(
+                "Failed to load model options: {error}. Press Enter to retry, or press `e` to enter a custom model manually."
+            ),
+        }
     }
 }
 
@@ -1330,7 +1601,22 @@ enum ConfigMode {
     Editing,
 }
 
-#[derive(Debug, Clone, Copy)]
+enum ConfigSetupLoopAction {
+    Continue,
+    Submit(ConfigSetupAction),
+    Cancel,
+}
+
+#[derive(Debug, Clone)]
+enum ModelOptionsState {
+    Unavailable,
+    Idle,
+    Loading,
+    Loaded(Vec<String>),
+    Error(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConfigField {
     Provider,
     BaseApiUrl,
@@ -1387,6 +1673,21 @@ fn cycle_generation_mode(current: GenerationMode, forward: bool) -> GenerationMo
             GenerationMode::Auto
         }
     }
+}
+
+fn can_load_model_options(
+    base_api_url: &str,
+    existing_api_token: Option<&str>,
+    pending_api_token: Option<&str>,
+) -> bool {
+    !base_api_url.trim().is_empty()
+        && pending_api_token
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+            .or(existing_api_token
+                .map(str::trim)
+                .filter(|token| !token.is_empty()))
+            .is_some()
 }
 
 fn make_textarea(title: &'static str, placeholder: &'static str) -> TextArea<'static> {
@@ -1453,10 +1754,15 @@ impl FileTreeNode {
 #[cfg(test)]
 mod tests {
     use super::{
-        CommitMode, CommitView, GenerationState, build_commit_status_lines, staged_files_tree_lines,
+        CommitMode, CommitView, ConfigMode, ConfigSetupInput, ConfigSetupLoopAction,
+        ConfigSetupView, GenerationState, ModelOptionsState, build_commit_status_lines,
+        can_load_model_options, handle_config_browsing_key, staged_files_tree_lines,
     };
     use crate::ai::SplitCommitPlan;
-    use crate::config::{CommitStyle, GenerationMode, ResolvedConventionalPreset};
+    use crate::config::{
+        CommitStyle, GenerationMode, Provider, ResolvedConventionalPreset, TokenStatus,
+    };
+    use crossterm::event::{KeyCode, KeyEvent};
 
     fn plain_text(lines: Vec<ratatui::text::Line<'static>>) -> Vec<String> {
         lines
@@ -1480,6 +1786,160 @@ mod tests {
         state.generation = GenerationState::Ready;
         state.mode = CommitMode::Browsing;
         state
+    }
+
+    fn setup_input() -> ConfigSetupInput {
+        ConfigSetupInput {
+            provider: Provider::Gemini,
+            base_api_url: "https://example.com/v1".to_string(),
+            base_model: "gemini-2.5-flash".to_string(),
+            commit_style: CommitStyle::Standard,
+            generation_mode: GenerationMode::Auto,
+            existing_api_token: Some("token".to_string()),
+            token_status: TokenStatus::Keychain,
+            token_present: true,
+        }
+    }
+
+    #[test]
+    fn requires_url_and_token_for_model_options() {
+        assert!(can_load_model_options(
+            "https://example.com/v1",
+            Some("token"),
+            None
+        ));
+        assert!(!can_load_model_options("", Some("token"), None));
+        assert!(!can_load_model_options(
+            "https://example.com/v1",
+            None,
+            Some("   ")
+        ));
+    }
+
+    #[test]
+    fn model_options_start_idle_when_setup_can_load_them() {
+        let state = ConfigSetupView::new(setup_input());
+        assert!(matches!(state.model_options, ModelOptionsState::Idle));
+    }
+
+    #[test]
+    fn editing_url_resets_model_options_until_prerequisites_return() {
+        let mut state = ConfigSetupView::new(setup_input());
+        state.selected = 1;
+        state.textarea = super::make_textarea_with_content("BASE_API_URL", "");
+        state.mode = ConfigMode::Editing;
+        state.finish_editing(true).unwrap();
+
+        assert!(matches!(
+            state.model_options,
+            ModelOptionsState::Unavailable
+        ));
+    }
+
+    #[test]
+    fn base_model_details_show_loaded_model_list() {
+        let mut state = ConfigSetupView::new(setup_input());
+        state.model_options = ModelOptionsState::Loaded(vec![
+            "gemini-2.5-flash".to_string(),
+            "gpt-4.1-mini".to_string(),
+        ]);
+
+        let detail = state.base_model_detail_text();
+
+        assert!(detail.contains("Available models:"));
+        assert!(detail.contains("  gemini-2.5-flash (current)"));
+        assert!(detail.contains("  gpt-4.1-mini"));
+    }
+
+    #[test]
+    fn enter_opens_model_picker() {
+        let mut state = ConfigSetupView::new(setup_input());
+        state.selected = 2;
+        state.model_options = ModelOptionsState::Loaded(vec![
+            "gemini-2.5-flash".to_string(),
+            "gpt-4.1-mini".to_string(),
+        ]);
+
+        let action =
+            handle_config_browsing_key(&mut state, KeyEvent::from(KeyCode::Enter)).unwrap();
+
+        assert!(matches!(action, ConfigSetupLoopAction::Continue));
+        assert!(state.model_picker_active);
+        assert_eq!(state.base_model, "gemini-2.5-flash");
+    }
+
+    #[test]
+    fn down_moves_model_picker_highlight() {
+        let mut state = ConfigSetupView::new(setup_input());
+        state.selected = 2;
+        state.model_options = ModelOptionsState::Loaded(vec![
+            "gemini-2.5-flash".to_string(),
+            "gpt-4.1-mini".to_string(),
+        ]);
+        state.model_picker_active = true;
+
+        let action = handle_config_browsing_key(&mut state, KeyEvent::from(KeyCode::Down)).unwrap();
+
+        assert!(matches!(action, ConfigSetupLoopAction::Continue));
+        assert_eq!(state.model_highlighted, 1);
+        assert_eq!(state.base_model, "gemini-2.5-flash");
+    }
+
+    #[test]
+    fn enter_applies_highlighted_model() {
+        let mut state = ConfigSetupView::new(setup_input());
+        state.selected = 2;
+        state.model_options = ModelOptionsState::Loaded(vec![
+            "gemini-2.5-flash".to_string(),
+            "gpt-4.1-mini".to_string(),
+        ]);
+        state.model_picker_active = true;
+        state.model_highlighted = 1;
+
+        let action =
+            handle_config_browsing_key(&mut state, KeyEvent::from(KeyCode::Enter)).unwrap();
+
+        assert!(matches!(action, ConfigSetupLoopAction::Continue));
+        assert_eq!(state.base_model, "gpt-4.1-mini");
+        assert!(!state.model_picker_active);
+    }
+
+    #[test]
+    fn esc_closes_model_picker_before_canceling_setup() {
+        let mut state = ConfigSetupView::new(setup_input());
+        state.selected = 2;
+        state.model_options = ModelOptionsState::Loaded(vec![
+            "gemini-2.5-flash".to_string(),
+            "gpt-4.1-mini".to_string(),
+        ]);
+        state.model_picker_active = true;
+        state.model_highlighted = 1;
+
+        let action = handle_config_browsing_key(&mut state, KeyEvent::from(KeyCode::Esc)).unwrap();
+
+        assert!(matches!(action, ConfigSetupLoopAction::Continue));
+        assert!(!state.model_picker_active);
+        assert_eq!(state.model_highlighted, 0);
+    }
+
+    #[test]
+    fn esc_cancels_config_setup() {
+        let mut state = ConfigSetupView::new(setup_input());
+
+        let action = handle_config_browsing_key(&mut state, KeyEvent::from(KeyCode::Esc)).unwrap();
+
+        assert!(matches!(action, ConfigSetupLoopAction::Cancel));
+    }
+
+    #[test]
+    fn cancel_row_cancels_config_setup() {
+        let mut state = ConfigSetupView::new(setup_input());
+        state.selected = super::ConfigField::all().len() - 1;
+
+        let action =
+            handle_config_browsing_key(&mut state, KeyEvent::from(KeyCode::Enter)).unwrap();
+
+        assert!(matches!(action, ConfigSetupLoopAction::Cancel));
     }
 
     #[test]
