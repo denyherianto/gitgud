@@ -35,24 +35,6 @@ Requirements:
 - Rust toolchain if building from source
 - An API token for AI-backed features unless you use `heuristic-only` mode
 
-## Features
-
-- Generate 1-3 commit message options from the staged diff
-- Use `auto`, `ai-only`, or `heuristic-only` commit generation modes
-- Explain the staged diff with what changed, likely intent, risks, and test ideas
-- Detect mixed staged concerns and let you approve file-based split commits in the TUI
-- Choose an option in the TUI and edit it inline before committing
-- Support standard and Conventional Commits styles, including configurable presets
-- Push the current branch to its upstream automatically
-- Offer `--force-with-lease` only after explicit confirmation
-- **Ask questions in natural language** — describe what you want to do and get exact Git command(s) with risk ratings, explanations, and alternatives
-- Configure provider, endpoint, token, model, and commit style in one setup screen
-- Load provider model options in setup after entering a base URL and API token
-- Use Gemini by default, or any OpenAI-compatible provider
-- Pass through normal Git commands like `status`, `log`, `diff`, and `branch`
-- Route bare natural language input (unrecognized as a Git subcommand) automatically to `ask`
-- Validate local setup with a `doctor` command
-
 ## Quick Start
 
 Interactive setup:
