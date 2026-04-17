@@ -397,6 +397,9 @@ fn validate_split_plan(plans: &[SplitCommitPlan], staged_files: &[String]) -> Re
     Ok(())
 }
 
+// Canonical SHA-1 hash of Git's empty tree object, used as the diff base
+// when a remote branch does not exist yet and the first push should be
+// treated as introducing the full repository contents.
 const EMPTY_TREE_HASH: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 const HUGE_GENERATED_LINE_THRESHOLD: usize = 2_000;
 const CONSOLE_LOG_WARNING_THRESHOLD: usize = 3;

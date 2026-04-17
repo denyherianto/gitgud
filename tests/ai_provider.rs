@@ -1,7 +1,7 @@
 use std::time::Duration;
 
-use gitgud::ai::{AiClient, AiConfig, PromptInput};
-use gitgud::config::{CommitStyle, Provider, ResolvedConventionalPreset};
+use gitgud::ai::{AiClient, AiConfig, DiffExplanation, PromptInput};
+use gitgud::config::{CommitStyle, GenerationMode, Provider, ResolvedConventionalPreset};
 use mockito::{Matcher, Server};
 
 fn prompt() -> PromptInput {
@@ -35,6 +35,7 @@ async fn generates_commit_message_from_mock_server() {
         &server.url(),
         "model",
         CommitStyle::Standard,
+        GenerationMode::Auto,
         ResolvedConventionalPreset::built_in_default(),
     )
     .unwrap();
@@ -62,6 +63,7 @@ async fn surfaces_split_commit_suggestions_from_mock_server() {
         &server.url(),
         "model",
         CommitStyle::Conventional,
+        GenerationMode::Auto,
         ResolvedConventionalPreset::built_in_default(),
     )
     .unwrap();
@@ -91,6 +93,45 @@ async fn surfaces_split_commit_suggestions_from_mock_server() {
 }
 
 #[tokio::test]
+async fn explains_diff_from_mock_server() {
+    let mut server = Server::new_async().await;
+    let _mock = server
+        .mock("POST", "/chat/completions")
+        .match_header("authorization", "Bearer token")
+        .with_status(200)
+        .with_body(r#"{"choices":[{"message":{"content":"{\"what_changed\":[\"Adds a new explain command\"],\"possible_intent\":[\"Help users understand staged diffs before committing\"],\"risk_areas\":[\"Explanations could overfit noisy diffs\"],\"test_suggestions\":[\"Cover the parser and command path with mocked responses\"]}"}}]}"#)
+        .create_async()
+        .await;
+
+    let config = AiConfig::new(
+        "token".into(),
+        Provider::Gemini,
+        &server.url(),
+        "model",
+        CommitStyle::Standard,
+        GenerationMode::Auto,
+        ResolvedConventionalPreset::built_in_default(),
+    )
+    .unwrap();
+    let client = AiClient::new(config).unwrap();
+    let explanation = client.generate_diff_explanation(&prompt()).await.unwrap();
+
+    assert_eq!(
+        explanation,
+        DiffExplanation {
+            what_changed: vec!["Adds a new explain command".to_string()],
+            possible_intent: vec![
+                "Help users understand staged diffs before committing".to_string()
+            ],
+            risk_areas: vec!["Explanations could overfit noisy diffs".to_string()],
+            test_suggestions: vec![
+                "Cover the parser and command path with mocked responses".to_string()
+            ],
+        }
+    );
+}
+
+#[tokio::test]
 async fn surfaces_auth_errors() {
     let mut server = Server::new_async().await;
     let _mock = server
@@ -106,6 +147,7 @@ async fn surfaces_auth_errors() {
         &server.url(),
         "model",
         CommitStyle::Standard,
+        GenerationMode::Auto,
         ResolvedConventionalPreset::built_in_default(),
     )
     .unwrap();
@@ -131,6 +173,7 @@ async fn surfaces_rate_limits() {
         &server.url(),
         "model",
         CommitStyle::Standard,
+        GenerationMode::Auto,
         ResolvedConventionalPreset::built_in_default(),
     )
     .unwrap();
@@ -156,6 +199,7 @@ async fn rejects_malformed_json() {
         &server.url(),
         "model",
         CommitStyle::Standard,
+        GenerationMode::Auto,
         ResolvedConventionalPreset::built_in_default(),
     )
     .unwrap();
@@ -184,13 +228,77 @@ async fn times_out_when_server_hangs() {
         &server.url(),
         "model",
         CommitStyle::Standard,
+        GenerationMode::Auto,
         ResolvedConventionalPreset::built_in_default(),
     )
     .unwrap()
     .with_timeout(Duration::from_millis(50));
     let client = AiClient::new(config).unwrap();
-    let options = client.generate_commit_options(&prompt()).await.unwrap();
+    let suggestions = client.generate_commit_suggestions(&prompt()).await.unwrap();
 
-    assert_eq!(options.len(), 3);
-    assert_eq!(options[0], "Update main");
+    assert_eq!(suggestions.options.len(), 3);
+    assert_eq!(suggestions.options[0], "Improve main");
+    assert_eq!(
+        suggestions.note.as_deref(),
+        Some("AI timed out. Showing heuristic commit options.")
+    );
+}
+
+#[tokio::test]
+async fn heuristic_only_skips_ai_requests() {
+    let config = AiConfig::new(
+        "token".into(),
+        Provider::Gemini,
+        "https://example.com",
+        "model",
+        CommitStyle::Standard,
+        GenerationMode::HeuristicOnly,
+        ResolvedConventionalPreset::built_in_default(),
+    )
+    .unwrap();
+    let client = AiClient::new(config).unwrap();
+    let suggestions = client.generate_commit_suggestions(&prompt()).await.unwrap();
+
+    assert_eq!(suggestions.options[0], "Improve main");
+    assert_eq!(
+        suggestions.note.as_deref(),
+        Some("Using heuristic commit options only.")
+    );
+}
+
+#[tokio::test]
+async fn ai_only_surfaces_timeout_without_fallback() {
+    let mut server = Server::new_async().await;
+    let _mock = server
+        .mock("POST", "/chat/completions")
+        .with_status(200)
+        .with_chunked_body(|writer| {
+            std::thread::sleep(Duration::from_millis(200));
+            writer.write_all(b"{\"choices\":[]}")
+        })
+        .create_async()
+        .await;
+
+    let config = AiConfig::new(
+        "token".into(),
+        Provider::Gemini,
+        &server.url(),
+        "model",
+        CommitStyle::Standard,
+        GenerationMode::AiOnly,
+        ResolvedConventionalPreset::built_in_default(),
+    )
+    .unwrap()
+    .with_timeout(Duration::from_millis(50));
+    let client = AiClient::new(config).unwrap();
+    let error = client
+        .generate_commit_suggestions(&prompt())
+        .await
+        .unwrap_err();
+
+    assert!(error.chain().any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(reqwest::Error::is_timeout)
+    }));
 }

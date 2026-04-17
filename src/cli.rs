@@ -18,6 +18,8 @@ pub struct Cli {
 pub enum Command {
     /// Generate 1-3 commit message options for staged changes
     Commit,
+    /// Explain the staged diff, including changes, intent, risks, and tests
+    Explain,
     /// Push the current branch automatically and confirm force-with-lease only when needed
     Push,
     /// Run a raw git command, including built-in names like `commit` or `push`
@@ -72,6 +74,7 @@ pub enum ConfigKey {
     BaseApiUrl,
     BaseModel,
     CommitStyle,
+    GenerationMode,
     ConventionalPreset,
 }
 
@@ -135,6 +138,16 @@ mod tests {
                 assert_eq!(args[0].to_string_lossy(), "commit");
                 assert_eq!(args[1].to_string_lossy(), "--amend");
             }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_explain_command() {
+        let cli = Cli::try_parse_from(["gg", "explain"]).unwrap();
+
+        match cli.command {
+            Some(Command::Explain) => {}
             other => panic!("unexpected command: {other:?}"),
         }
     }

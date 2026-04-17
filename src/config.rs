@@ -82,6 +82,30 @@ impl fmt::Display for CommitStyle {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum GenerationMode {
+    Auto,
+    AiOnly,
+    HeuristicOnly,
+}
+
+impl Default for GenerationMode {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+impl fmt::Display for GenerationMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            GenerationMode::Auto => write!(f, "auto"),
+            GenerationMode::AiOnly => write!(f, "ai-only"),
+            GenerationMode::HeuristicOnly => write!(f, "heuristic-only"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConventionalPreset {
     pub types: Vec<String>,
@@ -124,6 +148,8 @@ pub struct FileConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub commit_style: Option<CommitStyle>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation_mode: Option<GenerationMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub conventional_commits: Option<ConventionalCommitsConfig>,
 }
 
@@ -159,6 +185,7 @@ pub struct ResolvedAiSettings {
     pub base_api_url: ResolvedValue<String>,
     pub base_model: ResolvedValue<String>,
     pub commit_style: ResolvedValue<CommitStyle>,
+    pub generation_mode: ResolvedValue<GenerationMode>,
     pub conventional_preset: ResolvedValue<ResolvedConventionalPreset>,
 }
 
@@ -168,6 +195,7 @@ pub struct ResolvedNonSecretSettings {
     pub base_api_url: ResolvedValue<String>,
     pub base_model: ResolvedValue<String>,
     pub commit_style: ResolvedValue<CommitStyle>,
+    pub generation_mode: ResolvedValue<GenerationMode>,
     pub conventional_preset: ResolvedValue<ResolvedConventionalPreset>,
 }
 
@@ -209,6 +237,9 @@ pub fn set_config_value(key: ConfigKey, value: &str) -> Result<PathBuf> {
         ConfigKey::CommitStyle => {
             config.commit_style = Some(parse_commit_style(value)?);
         }
+        ConfigKey::GenerationMode => {
+            config.generation_mode = Some(parse_generation_mode(value)?);
+        }
         ConfigKey::ConventionalPreset => {
             let conventional = config
                 .conventional_commits
@@ -230,6 +261,7 @@ pub fn unset_config_value(key: ConfigKey) -> Result<PathBuf> {
         ConfigKey::BaseApiUrl => config.base_api_url = None,
         ConfigKey::BaseModel => config.base_model = None,
         ConfigKey::CommitStyle => config.commit_style = None,
+        ConfigKey::GenerationMode => config.generation_mode = None,
         ConfigKey::ConventionalPreset => {
             if let Some(conventional) = &mut config.conventional_commits {
                 conventional.preset = None;
@@ -347,6 +379,18 @@ fn parse_commit_style(raw: &str) -> Result<CommitStyle> {
         "standard" => Ok(CommitStyle::Standard),
         "conventional" => Ok(CommitStyle::Conventional),
         _ => bail!("commit style must be 'standard' or 'conventional'"),
+    }
+}
+
+fn parse_generation_mode(raw: &str) -> Result<GenerationMode> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "auto" => Ok(GenerationMode::Auto),
+        "ai-only" | "ai_only" | "aionly" => Ok(GenerationMode::AiOnly),
+        "heuristic-only" | "heuristic_only" | "heuristiconly" | "heuristic" => {
+            Ok(GenerationMode::HeuristicOnly)
+        }
+        _ => bail!("generation mode must be 'auto', 'ai-only', or 'heuristic-only'"),
     }
 }
 
@@ -492,6 +536,7 @@ pub fn resolve_ai_settings_from(
         base_api_url: non_secret.base_api_url,
         base_model: non_secret.base_model,
         commit_style: non_secret.commit_style,
+        generation_mode: non_secret.generation_mode,
         conventional_preset: non_secret.conventional_preset,
     })
 }
@@ -577,6 +622,17 @@ pub fn resolve_non_secret_settings_from(
             source: ValueSource::BuiltIn,
         }
     };
+    let generation_mode = if let Some(generation_mode) = file.generation_mode {
+        ResolvedValue {
+            value: generation_mode,
+            source: ValueSource::ConfigFile,
+        }
+    } else {
+        ResolvedValue {
+            value: GenerationMode::default(),
+            source: ValueSource::BuiltIn,
+        }
+    };
     let conventional_preset = resolve_conventional_preset_from(file)?;
 
     Ok(ResolvedNonSecretSettings {
@@ -584,6 +640,7 @@ pub fn resolve_non_secret_settings_from(
         base_api_url,
         base_model,
         commit_style,
+        generation_mode,
         conventional_preset,
     })
 }
@@ -600,9 +657,9 @@ mod tests {
 
     use super::{
         CommitStyle, ConventionalCommitsConfig, ConventionalPreset,
-        DEFAULT_CONVENTIONAL_PRESET_NAME, FileConfig, Provider, ValueSource, load_file_from_path,
-        parse_commit_style, parse_provider, resolve_ai_settings_from,
-        resolve_non_secret_settings_from, save_file_to_path,
+        DEFAULT_CONVENTIONAL_PRESET_NAME, FileConfig, GenerationMode, Provider, ValueSource,
+        load_file_from_path, parse_commit_style, parse_generation_mode, parse_provider,
+        resolve_ai_settings_from, resolve_non_secret_settings_from, save_file_to_path,
     };
 
     #[test]
@@ -728,6 +785,7 @@ mod tests {
             base_api_url: Some("https://example.com/v1".into()),
             base_model: Some("example-model".into()),
             commit_style: Some(CommitStyle::Conventional),
+            generation_mode: Some(GenerationMode::AiOnly),
             conventional_commits: Some(ConventionalCommitsConfig {
                 preset: Some("team".into()),
                 presets: BTreeMap::from([(
@@ -782,6 +840,19 @@ mod tests {
     fn rejects_unknown_commit_style() {
         let error = parse_commit_style("squash").unwrap_err();
         assert!(error.to_string().contains("commit style"));
+    }
+
+    #[test]
+    fn parses_generation_mode_aliases() {
+        assert_eq!(parse_generation_mode("auto").unwrap(), GenerationMode::Auto);
+        assert_eq!(
+            parse_generation_mode("ai_only").unwrap(),
+            GenerationMode::AiOnly
+        );
+        assert_eq!(
+            parse_generation_mode("heuristic").unwrap(),
+            GenerationMode::HeuristicOnly
+        );
     }
 
     #[test]

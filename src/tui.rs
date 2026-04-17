@@ -23,10 +23,11 @@ use tui_textarea::{Input, Key, TextArea};
 
 use crate::{
     ai::{
-        AiClient, CommitSuggestions, PromptInput, SplitCommitPlan, normalize_base_api_url,
+        AiClient, CommitSuggestions, PromptInput, SplitCommitPlan,
+        build_heuristic_commit_suggestions, normalize_base_api_url,
         validate_commit_message_with_preset,
     },
-    config::{CommitStyle, Provider, ResolvedConventionalPreset, TokenStatus},
+    config::{CommitStyle, GenerationMode, Provider, ResolvedConventionalPreset, TokenStatus},
     git::{GitRepo, PushPlan, RepoStatus, UnsafeDiffWarning},
 };
 
@@ -46,11 +47,18 @@ pub enum CommitAction {
 }
 
 #[derive(Debug, Clone)]
+pub enum CommitGenerator {
+    Ai(AiClient),
+    HeuristicOnly,
+}
+
+#[derive(Debug, Clone)]
 pub struct ConfigSetupInput {
     pub provider: Provider,
     pub base_api_url: String,
     pub base_model: String,
     pub commit_style: CommitStyle,
+    pub generation_mode: GenerationMode,
     pub token_status: TokenStatus,
     pub token_present: bool,
 }
@@ -61,6 +69,7 @@ pub struct ConfigSetupAction {
     pub base_api_url: String,
     pub base_model: String,
     pub commit_style: CommitStyle,
+    pub generation_mode: GenerationMode,
     pub api_token: Option<String>,
 }
 
@@ -83,8 +92,9 @@ pub fn run_home(status: &RepoStatus) -> Result<HomeAction> {
 
 pub async fn run_commit(
     repo: &GitRepo,
-    ai: AiClient,
+    generator: CommitGenerator,
     commit_style: CommitStyle,
+    generation_mode: GenerationMode,
     conventional_preset: ResolvedConventionalPreset,
 ) -> Result<CommitAction> {
     let branch = repo.current_branch().or_else(|error| {
@@ -111,9 +121,10 @@ pub async fn run_commit(
     let mut state = CommitView::new(
         input.staged_files.clone(),
         commit_style,
+        generation_mode,
         conventional_preset,
     );
-    state.start_generation(ai, input);
+    state.start_generation(generator, input);
     with_terminal(|terminal| commit_loop(terminal, &mut state))
 }
 
@@ -380,7 +391,9 @@ fn handle_config_browsing_key(
             Err(error) => state.error = Some(error.to_string()),
         },
         KeyCode::Enter => match state.selected_field() {
-            ConfigField::Provider | ConfigField::CommitStyle => state.cycle_selected(true),
+            ConfigField::Provider | ConfigField::CommitStyle | ConfigField::GenerationMode => {
+                state.cycle_selected(true)
+            }
             ConfigField::BaseApiUrl | ConfigField::BaseModel | ConfigField::ApiToken => {
                 state.begin_editing_selected()
             }
@@ -584,17 +597,26 @@ fn build_commit_status_lines(state: &CommitView) -> Vec<Line<'static>> {
     } else {
         format!("Style: {}", state.commit_style)
     };
+    let generation_line = format!("Generation: {}", state.generation_mode);
 
     let mut lines = vec![
         Line::from(style_line),
+        Line::from(generation_line),
         Line::from(format!("Staged count: {}", state.staged_files.len())),
         Line::from("Left/Right scroll staged tree  PgUp/PgDn jump  Home/End edges"),
         Line::from(status_text.to_string()),
     ];
 
+    if let Some(note) = &state.generation_note {
+        lines.push(Line::from(vec![Span::styled(
+            note.clone(),
+            Style::default().fg(Color::Yellow),
+        )]));
+    }
+
     if matches!(state.commit_style, CommitStyle::Conventional) {
         lines.insert(
-            1,
+            2,
             Line::from(format!(
                 "Allowed types: {}",
                 state.conventional_preset.types.join(", ")
@@ -647,7 +669,7 @@ fn draw_config_setup(frame: &mut ratatui::Frame<'_>, state: &ConfigSetupView) {
         .split(layout[1]);
 
     let header = Paragraph::new(vec![
-        Line::from("Configure provider, endpoint, model, token, and commit style."),
+        Line::from("Configure provider, endpoint, model, token, and commit generation."),
         Line::from(state.status_line()),
     ])
     .block(Block::default().borders(Borders::ALL).title("Setup"))
@@ -888,10 +910,11 @@ fn key_event_to_textarea_input(key: KeyEvent) -> Input {
 struct CommitView {
     textarea: TextArea<'static>,
     generation: GenerationState,
+    generation_note: Option<String>,
     mode: CommitMode,
     staged_files: Vec<String>,
     receiver: Option<Receiver<Result<CommitSuggestions>>>,
-    generator: Option<(AiClient, PromptInput)>,
+    generator: Option<(CommitGenerator, PromptInput)>,
     options: Vec<String>,
     drafts: Vec<String>,
     split_plans: Vec<SplitCommitPlan>,
@@ -901,6 +924,7 @@ struct CommitView {
     split_requested: Option<Vec<SplitCommitPlan>>,
     cancelled: bool,
     commit_style: CommitStyle,
+    generation_mode: GenerationMode,
     conventional_preset: ResolvedConventionalPreset,
 }
 
@@ -908,11 +932,13 @@ impl CommitView {
     fn new(
         staged_files: Vec<String>,
         commit_style: CommitStyle,
+        generation_mode: GenerationMode,
         conventional_preset: ResolvedConventionalPreset,
     ) -> Self {
         Self {
             textarea: make_textarea("Draft", "Generating commit message options..."),
             generation: GenerationState::Loading,
+            generation_note: None,
             mode: CommitMode::Browsing,
             staged_files,
             receiver: None,
@@ -926,28 +952,30 @@ impl CommitView {
             split_requested: None,
             cancelled: false,
             commit_style,
+            generation_mode,
             conventional_preset,
         }
     }
 
-    fn start_generation(&mut self, ai: AiClient, input: PromptInput) {
-        self.generator = Some((ai.clone(), input.clone()));
-        self.spawn_generation(ai, input);
+    fn start_generation(&mut self, generator: CommitGenerator, input: PromptInput) {
+        self.generator = Some((generator.clone(), input.clone()));
+        self.spawn_generation(generator, input);
     }
 
     fn restart_generation(&mut self) -> Result<()> {
-        let (ai, input) = self
+        let (generator, input) = self
             .generator
             .clone()
             .ok_or_else(|| anyhow!("commit generation is not configured"))?;
-        self.spawn_generation(ai, input);
+        self.spawn_generation(generator, input);
         Ok(())
     }
 
-    fn spawn_generation(&mut self, ai: AiClient, input: PromptInput) {
+    fn spawn_generation(&mut self, generator: CommitGenerator, input: PromptInput) {
         let (tx, rx) = mpsc::channel();
         self.receiver = Some(rx);
         self.generation = GenerationState::Loading;
+        self.generation_note = None;
         self.mode = CommitMode::Browsing;
         self.options.clear();
         self.drafts.clear();
@@ -958,7 +986,14 @@ impl CommitView {
         self.textarea = make_textarea("Draft", "Generating commit message options...");
 
         tokio::spawn(async move {
-            let result = ai.generate_commit_suggestions(&input).await;
+            let result = match generator {
+                CommitGenerator::Ai(ai) => ai.generate_commit_suggestions(&input).await,
+                CommitGenerator::HeuristicOnly => {
+                    let mut suggestions = build_heuristic_commit_suggestions(&input);
+                    suggestions.note = Some("Using heuristic commit options only.".to_string());
+                    Ok(suggestions)
+                }
+            };
             let _ = tx.send(result);
         });
     }
@@ -976,12 +1011,14 @@ impl CommitView {
                         self.options = suggestions.options.clone();
                         self.drafts = suggestions.options;
                         self.split_plans = suggestions.split;
+                        self.generation_note = suggestions.note;
                         self.list_state.select(Some(0));
                         self.load_selected_draft();
                         self.generation = GenerationState::Ready;
                     }
                     Err(error) => {
                         self.generation = GenerationState::Error(error.to_string());
+                        self.generation_note = None;
                         self.textarea = make_textarea("Draft", "No commit draft available");
                     }
                 }
@@ -989,6 +1026,7 @@ impl CommitView {
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => {
                 self.receiver = None;
+                self.generation_note = None;
                 self.generation = GenerationState::Error("generation task disconnected".into());
             }
         }
@@ -1071,6 +1109,7 @@ struct ConfigSetupView {
     base_api_url: String,
     base_model: String,
     commit_style: CommitStyle,
+    generation_mode: GenerationMode,
     pending_api_token: String,
     token_status: TokenStatus,
     token_present: bool,
@@ -1088,6 +1127,7 @@ impl ConfigSetupView {
             base_api_url: input.base_api_url,
             base_model: input.base_model,
             commit_style: input.commit_style,
+            generation_mode: input.generation_mode,
             pending_api_token: String::new(),
             token_status: input.token_status,
             token_present: input.token_present,
@@ -1117,6 +1157,9 @@ impl ConfigSetupView {
             }
             ConfigField::CommitStyle => {
                 self.commit_style = cycle_commit_style(self.commit_style, forward);
+            }
+            ConfigField::GenerationMode => {
+                self.generation_mode = cycle_generation_mode(self.generation_mode, forward);
             }
             _ => {}
         }
@@ -1159,7 +1202,8 @@ impl ConfigSetupView {
             bail!("BASE_MODEL cannot be empty");
         }
 
-        if matches!(self.token_status, TokenStatus::Missing)
+        if !matches!(self.generation_mode, GenerationMode::HeuristicOnly)
+            && matches!(self.token_status, TokenStatus::Missing)
             && !self.token_present
             && self.pending_api_token.trim().is_empty()
         {
@@ -1171,6 +1215,7 @@ impl ConfigSetupView {
             base_api_url,
             base_model: base_model.to_string(),
             commit_style: self.commit_style,
+            generation_mode: self.generation_mode,
             api_token: if self.pending_api_token.trim().is_empty() {
                 None
             } else {
@@ -1188,6 +1233,9 @@ impl ConfigSetupView {
             ConfigField::BaseModel => format!("BASE_MODEL: {}", self.base_model),
             ConfigField::ApiToken => format!("API_TOKEN: {}", self.token_label()),
             ConfigField::CommitStyle => format!("Commit Style: {}", self.commit_style),
+            ConfigField::GenerationMode => {
+                format!("Generation Mode: {}", self.generation_mode)
+            }
             ConfigField::Save => "Save".to_string(),
             ConfigField::Cancel => "Cancel".to_string(),
         }
@@ -1229,6 +1277,9 @@ impl ConfigSetupView {
             ConfigField::CommitStyle => {
                 "Choose `standard` for plain Git subjects or `conventional` for Conventional Commits. Custom Conventional Commit presets can be selected with `gg config set conventional-preset <name>` after defining them in the config file.".to_string()
             }
+            ConfigField::GenerationMode => {
+                "Choose `auto` to use AI with timeout fallback, `ai-only` to require the provider, or `heuristic-only` to skip AI and use local suggestions.".to_string()
+            }
             ConfigField::Save => {
                 "Save the current settings. BASE_API_URL and BASE_MODEL are written to the config file; API_TOKEN is stored in the keychain.".to_string()
             }
@@ -1249,13 +1300,21 @@ impl ConfigSetupView {
     fn status_line(&self) -> String {
         match &self.error {
             Some(error) => format!("Error: {error}"),
-            None => match self.token_status {
-                TokenStatus::EnvironmentOverride => {
-                    "Environment token override is active; a saved token will be ignored until it is removed.".to_string()
+            None => {
+                if matches!(self.generation_mode, GenerationMode::HeuristicOnly) {
+                    "Heuristic-only mode skips the AI provider for commit suggestions.".to_string()
+                } else {
+                    match self.token_status {
+                        TokenStatus::EnvironmentOverride => {
+                            "Environment token override is active; a saved token will be ignored until it is removed.".to_string()
+                        }
+                        TokenStatus::Keychain => {
+                            "A token is already stored in the system keychain.".to_string()
+                        }
+                        TokenStatus::Missing => "No API token is currently configured.".to_string(),
+                    }
                 }
-                TokenStatus::Keychain => "A token is already stored in the system keychain.".to_string(),
-                TokenStatus::Missing => "No API token is currently configured.".to_string(),
-            },
+            }
         }
     }
 
@@ -1278,6 +1337,7 @@ enum ConfigField {
     BaseModel,
     ApiToken,
     CommitStyle,
+    GenerationMode,
     Save,
     Cancel,
 }
@@ -1290,6 +1350,7 @@ impl ConfigField {
             ConfigField::BaseModel,
             ConfigField::ApiToken,
             ConfigField::CommitStyle,
+            ConfigField::GenerationMode,
             ConfigField::Save,
             ConfigField::Cancel,
         ]
@@ -1311,6 +1372,20 @@ fn cycle_commit_style(current: CommitStyle, forward: bool) -> CommitStyle {
             CommitStyle::Conventional
         }
         (CommitStyle::Conventional, true) | (CommitStyle::Standard, false) => CommitStyle::Standard,
+    }
+}
+
+fn cycle_generation_mode(current: GenerationMode, forward: bool) -> GenerationMode {
+    match (current, forward) {
+        (GenerationMode::Auto, true) | (GenerationMode::HeuristicOnly, false) => {
+            GenerationMode::AiOnly
+        }
+        (GenerationMode::AiOnly, true) | (GenerationMode::Auto, false) => {
+            GenerationMode::HeuristicOnly
+        }
+        (GenerationMode::HeuristicOnly, true) | (GenerationMode::AiOnly, false) => {
+            GenerationMode::Auto
+        }
     }
 }
 
@@ -1381,7 +1456,7 @@ mod tests {
         CommitMode, CommitView, GenerationState, build_commit_status_lines, staged_files_tree_lines,
     };
     use crate::ai::SplitCommitPlan;
-    use crate::config::{CommitStyle, ResolvedConventionalPreset};
+    use crate::config::{CommitStyle, GenerationMode, ResolvedConventionalPreset};
 
     fn plain_text(lines: Vec<ratatui::text::Line<'static>>) -> Vec<String> {
         lines
@@ -1399,6 +1474,7 @@ mod tests {
         let mut state = CommitView::new(
             vec!["src/tui.rs".to_string()],
             CommitStyle::Standard,
+            GenerationMode::Auto,
             ResolvedConventionalPreset::built_in_default(),
         );
         state.generation = GenerationState::Ready;

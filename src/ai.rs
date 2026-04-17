@@ -4,7 +4,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{CommitStyle, Provider, ResolvedConventionalPreset, resolve_ai_settings};
+use crate::config::{
+    CommitStyle, GenerationMode, Provider, ResolvedConventionalPreset, resolve_ai_settings,
+};
 
 pub const DEFAULT_PROVIDER: Provider = Provider::Gemini;
 pub const DEFAULT_BASE_API_URL: &str = "https://generativelanguage.googleapis.com/v1beta/openai";
@@ -20,6 +22,7 @@ pub struct AiConfig {
     pub base_api_url: String,
     pub base_model: String,
     pub commit_style: CommitStyle,
+    pub generation_mode: GenerationMode,
     pub conventional_preset: ResolvedConventionalPreset,
     pub timeout: Duration,
 }
@@ -33,6 +36,7 @@ impl AiConfig {
             &resolved.base_api_url.value,
             &resolved.base_model.value,
             resolved.commit_style.value,
+            resolved.generation_mode.value,
             resolved.conventional_preset.value,
         )
     }
@@ -43,6 +47,7 @@ impl AiConfig {
         base_api_url: &str,
         base_model: &str,
         commit_style: CommitStyle,
+        generation_mode: GenerationMode,
         conventional_preset: ResolvedConventionalPreset,
     ) -> Result<Self> {
         if api_token.trim().is_empty() {
@@ -59,6 +64,7 @@ impl AiConfig {
             base_api_url: normalize_base_api_url(base_api_url)?,
             base_model: base_model.trim().to_string(),
             commit_style,
+            generation_mode,
             conventional_preset,
             timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
         })
@@ -84,6 +90,15 @@ pub struct PromptInput {
 pub struct CommitSuggestions {
     pub options: Vec<String>,
     pub split: Vec<SplitCommitPlan>,
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffExplanation {
+    pub what_changed: Vec<String>,
+    pub possible_intent: Vec<String>,
+    pub risk_areas: Vec<String>,
+    pub test_suggestions: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,10 +146,25 @@ impl AiClient {
         &self,
         input: &PromptInput,
     ) -> Result<CommitSuggestions> {
-        match self.generate_commit_suggestions_from_provider(input).await {
-            Ok(suggestions) => Ok(suggestions),
-            Err(error) if is_timeout_error(&error) => Ok(build_heuristic_commit_suggestions(input)),
-            Err(error) => Err(error),
+        match self.config.generation_mode {
+            GenerationMode::Auto => {
+                match self.generate_commit_suggestions_from_provider(input).await {
+                    Ok(suggestions) => Ok(suggestions),
+                    Err(error) if is_timeout_error(&error) => {
+                        let mut suggestions = build_heuristic_commit_suggestions(input);
+                        suggestions.note =
+                            Some("AI timed out. Showing heuristic commit options.".to_string());
+                        Ok(suggestions)
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            GenerationMode::AiOnly => self.generate_commit_suggestions_from_provider(input).await,
+            GenerationMode::HeuristicOnly => {
+                let mut suggestions = build_heuristic_commit_suggestions(input);
+                suggestions.note = Some("Using heuristic commit options only.".to_string());
+                Ok(suggestions)
+            }
         }
     }
 
@@ -144,10 +174,41 @@ impl AiClient {
             .map(|suggestions| suggestions.options)
     }
 
+    pub async fn generate_diff_explanation(&self, input: &PromptInput) -> Result<DiffExplanation> {
+        let content = self
+            .request_chat_completion(
+                build_diff_explanation_system_prompt(),
+                build_diff_explanation_prompt(input),
+            )
+            .await?;
+
+        parse_diff_explanation(&content)
+    }
+
     async fn generate_commit_suggestions_from_provider(
         &self,
         input: &PromptInput,
     ) -> Result<CommitSuggestions> {
+        let content = self
+            .request_chat_completion(
+                build_system_prompt(input.commit_style, &input.conventional_preset),
+                build_commit_prompt(input),
+            )
+            .await?;
+
+        parse_commit_suggestions_with_preset(
+            &content,
+            input,
+            input.commit_style,
+            &input.conventional_preset,
+        )
+    }
+
+    async fn request_chat_completion(
+        &self,
+        system_prompt: String,
+        user_prompt: String,
+    ) -> Result<String> {
         let endpoint = format!("{}/chat/completions", self.config.base_api_url);
         let request = ChatCompletionRequest {
             model: self.config.base_model.clone(),
@@ -155,11 +216,11 @@ impl AiClient {
             messages: vec![
                 ChatMessage {
                     role: "system".to_string(),
-                    content: build_system_prompt(input.commit_style, &input.conventional_preset),
+                    content: system_prompt,
                 },
                 ChatMessage {
                     role: "user".to_string(),
-                    content: build_commit_prompt(input),
+                    content: user_prompt,
                 },
             ],
         };
@@ -185,19 +246,12 @@ impl AiClient {
 
         let parsed: ChatCompletionResponse =
             serde_json::from_str(&body).context("failed to parse AI response JSON")?;
-        let content = parsed
+        parsed
             .choices
             .into_iter()
             .next()
             .map(|choice| choice.message.content)
-            .ok_or_else(|| anyhow!("AI provider returned no choices"))?;
-
-        parse_commit_suggestions_with_preset(
-            &content,
-            input,
-            input.commit_style,
-            &input.conventional_preset,
-        )
+            .ok_or_else(|| anyhow!("AI provider returned no choices"))
     }
 }
 
@@ -212,28 +266,33 @@ pub fn normalize_base_api_url(raw: &str) -> Result<String> {
 }
 
 pub fn build_commit_prompt(input: &PromptInput) -> String {
+    format!(
+        "Commit style: {}{}\n{}",
+        match input.commit_style {
+            CommitStyle::Standard => "standard",
+            CommitStyle::Conventional => "conventional",
+        },
+        build_conventional_context(input),
+        build_diff_context(input, DEFAULT_MAX_DIFF_CHARS)
+    )
+}
+
+pub fn build_diff_explanation_prompt(input: &PromptInput) -> String {
+    format!(
+        "Explain this staged diff in four sections: what changed, possible intent, risk areas, and test suggestions.\n{}",
+        build_diff_context(input, DEFAULT_MAX_DIFF_CHARS)
+    )
+}
+
+fn build_diff_context(input: &PromptInput, max_diff_chars: usize) -> String {
     let file_list = if input.staged_files.is_empty() {
         "(none)".to_string()
     } else {
         input.staged_files.join(", ")
     };
 
-    let style = match input.commit_style {
-        CommitStyle::Standard => "standard",
-        CommitStyle::Conventional => "conventional",
-    };
-    let conventional_context = if matches!(input.commit_style, CommitStyle::Conventional) {
-        format!(
-            "\nConventional preset: {}\nAllowed types: {}",
-            input.conventional_preset.name,
-            input.conventional_preset.types.join(", ")
-        )
-    } else {
-        String::new()
-    };
-
     format!(
-        "Commit style: {style}{conventional_context}\nBranch: {}\nStaged files: {}\nDiff summary:\n{}\n\nStaged patch:\n{}",
+        "Branch: {}\nStaged files: {}\nDiff summary:\n{}\n\nStaged patch:\n{}",
         input.branch,
         file_list,
         if input.diff_stat.trim().is_empty() {
@@ -241,8 +300,20 @@ pub fn build_commit_prompt(input: &PromptInput) -> String {
         } else {
             input.diff_stat.trim()
         },
-        truncate_diff(&input.diff, DEFAULT_MAX_DIFF_CHARS)
+        truncate_diff(&input.diff, max_diff_chars)
     )
+}
+
+fn build_conventional_context(input: &PromptInput) -> String {
+    if matches!(input.commit_style, CommitStyle::Conventional) {
+        format!(
+            "\nConventional preset: {}\nAllowed types: {}",
+            input.conventional_preset.name,
+            input.conventional_preset.types.join(", ")
+        )
+    } else {
+        String::new()
+    }
 }
 
 pub fn truncate_diff(diff: &str, max_chars: usize) -> String {
@@ -313,19 +384,18 @@ pub fn validate_commit_message_with_preset(
 
 pub fn build_heuristic_commit_suggestions(input: &PromptInput) -> CommitSuggestions {
     let subject = describe_change_subject(&input.staged_files);
-    let standard = [
-        format!("Update {subject}"),
-        format!("Refine {subject} handling"),
-        format!("Adjust {subject} flow"),
-    ];
+    let descriptions = build_heuristic_option_descriptions(input, &subject);
+    let standard = descriptions
+        .iter()
+        .map(|description| sentence_case(description))
+        .collect::<Vec<_>>();
 
     let conventional_type = infer_conventional_type(input);
     let conventional_scope = infer_conventional_scope(&input.staged_files);
-    let conventional = [
-        format!("{conventional_type}({conventional_scope}): update {subject}"),
-        format!("{conventional_type}({conventional_scope}): refine {subject} handling"),
-        format!("{conventional_type}({conventional_scope}): adjust {subject} flow"),
-    ];
+    let conventional = descriptions
+        .iter()
+        .map(|description| format!("{conventional_type}({conventional_scope}): {description}"))
+        .collect::<Vec<_>>();
 
     let candidates = match input.commit_style {
         CommitStyle::Standard => standard,
@@ -335,6 +405,7 @@ pub fn build_heuristic_commit_suggestions(input: &PromptInput) -> CommitSuggesti
     CommitSuggestions {
         options: candidates.into_iter().map(limit_subject_to_72).collect(),
         split: build_heuristic_split_suggestions(input),
+        note: None,
     }
 }
 
@@ -361,6 +432,10 @@ fn build_system_prompt(
     format!(
         "You write concise Git commit messages. Return valid JSON only with this shape: {{\"options\":[\"message 1\",\"message 2\",\"message 3\"],\"split\":[{{\"message\":\"message a\",\"files\":[\"path/a.rs\"]}},{{\"message\":\"message b\",\"files\":[\"path/b.rs\"]}}]}}. Provide 1 to 3 distinct options in `options`. Add `split` only when the staged changes mix multiple concerns that should be committed separately; when present, `split` must contain 2 to 4 objects and each object must include a commit `message` plus the staged `files` that belong in that commit. The split plan must cover every staged file exactly once. Each message may include a blank line and body, but no markdown fences, labels, numbering, or commentary. Describe only the staged changes. {style_rules}"
     )
+}
+
+fn build_diff_explanation_system_prompt() -> String {
+    "You explain staged Git diffs for engineers. Return valid JSON only with this shape: {\"what_changed\":[\"item 1\"],\"possible_intent\":[\"item 1\"],\"risk_areas\":[\"item 1\"],\"test_suggestions\":[\"item 1\"]}. Each field must be an array of 1 to 4 concise strings. Base `what_changed`, `risk_areas`, and `test_suggestions` on the diff only. `possible_intent` may be an inference from the diff. Do not use markdown fences, headings, numbering, or extra commentary.".to_string()
 }
 
 #[cfg(test)]
@@ -408,7 +483,41 @@ fn parse_commit_suggestions_with_preset(
 
     let split = resolve_split_plans(parsed.split, input, commit_style, conventional_preset)?;
 
-    Ok(CommitSuggestions { options, split })
+    Ok(CommitSuggestions {
+        options,
+        split,
+        note: None,
+    })
+}
+
+fn parse_diff_explanation(raw: &str) -> Result<DiffExplanation> {
+    let parsed: DiffExplanationPayload =
+        serde_json::from_str(raw).context("failed to parse diff explanation JSON")?;
+
+    Ok(DiffExplanation {
+        what_changed: normalize_explanation_items(parsed.what_changed, "what_changed")?,
+        possible_intent: normalize_explanation_items(parsed.possible_intent, "possible_intent")?,
+        risk_areas: normalize_explanation_items(parsed.risk_areas, "risk_areas")?,
+        test_suggestions: normalize_explanation_items(parsed.test_suggestions, "test_suggestions")?,
+    })
+}
+
+fn normalize_explanation_items(items: Vec<String>, field: &str) -> Result<Vec<String>> {
+    let normalized = items
+        .into_iter()
+        .map(|item| item.trim().trim_start_matches("- ").trim().to_string())
+        .filter(|item| !item.is_empty())
+        .collect::<Vec<_>>();
+
+    if normalized.is_empty() {
+        bail!("AI provider diff explanation field `{field}` must contain at least one item");
+    }
+
+    if normalized.iter().any(|item| item.contains("```")) {
+        bail!("diff explanation field `{field}` must not contain markdown fences");
+    }
+
+    Ok(normalized)
 }
 
 #[cfg(test)]
@@ -925,6 +1034,146 @@ fn describe_change_subject(staged_files: &[String]) -> String {
         .unwrap_or_else(|| "project".to_string())
 }
 
+fn build_heuristic_option_descriptions(input: &PromptInput, subject: &str) -> [String; 3] {
+    let diff = staged_patch_signal_text(&input.diff);
+
+    if input
+        .staged_files
+        .iter()
+        .all(|path| path == "README.md" || path.starts_with("docs/"))
+    {
+        return [
+            format!("update {subject}"),
+            format!("clarify {subject} details"),
+            format!("revise {subject} guidance"),
+        ];
+    }
+
+    if input
+        .staged_files
+        .iter()
+        .all(|path| path.starts_with("tests/"))
+    {
+        return [
+            format!("expand {subject} coverage"),
+            format!("add {subject} regression tests"),
+            format!("strengthen {subject} assertions"),
+        ];
+    }
+
+    if input
+        .staged_files
+        .iter()
+        .any(|path| path.starts_with(".github/workflows/"))
+    {
+        return [
+            format!("update {subject}"),
+            format!("improve {subject} reliability"),
+            format!("refine {subject} checks"),
+        ];
+    }
+
+    if input
+        .staged_files
+        .iter()
+        .any(|path| path == "install.sh" || path == "Cargo.toml" || path == "Cargo.lock")
+    {
+        return [
+            format!("update {subject} setup"),
+            format!("improve {subject} reliability"),
+            format!("streamline {subject} flow"),
+        ];
+    }
+
+    if contains_any(&diff, &["retry"]) && contains_any(&diff, &["fallback"]) {
+        return [
+            format!("retry {subject} generation before fallback"),
+            format!("reduce {subject} fallback usage"),
+            format!("improve {subject} timeout recovery"),
+        ];
+    }
+
+    if contains_any(&diff, &["timeout", "timed out"]) {
+        return [
+            format!("handle {subject} timeouts gracefully"),
+            format!("retry {subject} requests on timeout"),
+            format!("improve {subject} timeout recovery"),
+        ];
+    }
+
+    if contains_any(&diff, &["fallback"]) {
+        return [
+            format!("reduce {subject} fallback usage"),
+            format!("tighten {subject} fallback handling"),
+            format!("improve {subject} reliability"),
+        ];
+    }
+
+    if contains_any(
+        &diff,
+        &[
+            "perf",
+            "optimiz",
+            "faster",
+            "latency",
+            "cache",
+            "throughput",
+        ],
+    ) {
+        return [
+            format!("optimize {subject}"),
+            format!("reduce {subject} latency"),
+            format!("improve {subject} throughput"),
+        ];
+    }
+
+    if contains_any(
+        &diff,
+        &["null", "none", "missing", "guard", "error", "handle", "fix"],
+    ) {
+        return [
+            format!("fix {subject} handling"),
+            format!("guard {subject} edge cases"),
+            format!("improve {subject} reliability"),
+        ];
+    }
+
+    if contains_any(
+        &diff,
+        &["add ", "new ", "create", "introduce", "support", "enable"],
+    ) {
+        return [
+            format!("add {subject} support"),
+            format!("expand {subject} flow"),
+            format!("introduce {subject} improvements"),
+        ];
+    }
+
+    [
+        format!("improve {subject}"),
+        format!("refine {subject} behavior"),
+        format!("clean up {subject} flow"),
+    ]
+}
+
+fn staged_patch_signal_text(diff: &str) -> String {
+    diff.lines()
+        .filter_map(|line| {
+            if let Some(added) = line.strip_prefix('+') {
+                return (!line.starts_with("+++")).then_some(added);
+            }
+
+            if let Some(removed) = line.strip_prefix('-') {
+                return (!line.starts_with("---")).then_some(removed);
+            }
+
+            None
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_ascii_lowercase()
+}
+
 fn infer_conventional_type(input: &PromptInput) -> String {
     let branch = input.branch.to_ascii_lowercase();
     let diff = input.diff.to_ascii_lowercase();
@@ -1066,6 +1315,17 @@ fn limit_subject_to_72(subject: String) -> String {
         .to_string()
 }
 
+fn sentence_case(raw: &str) -> String {
+    let mut chars = raw.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+
+    let mut result = first.to_ascii_uppercase().to_string();
+    result.push_str(chars.as_str());
+    result
+}
+
 #[derive(Debug, Serialize)]
 struct ChatCompletionRequest {
     model: String,
@@ -1099,6 +1359,14 @@ struct CommitOptionsPayload {
     options: Vec<String>,
     #[serde(default)]
     split: Vec<SplitPlanPayload>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DiffExplanationPayload {
+    what_changed: Vec<String>,
+    possible_intent: Vec<String>,
+    risk_areas: Vec<String>,
+    test_suggestions: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1146,12 +1414,13 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        AiConfig, DEFAULT_BASE_API_URL, SplitCommitPlan, build_commit_prompt,
-        build_heuristic_commit_options, build_heuristic_commit_suggestions, normalize_base_api_url,
-        parse_commit_options, parse_commit_suggestions, parse_commit_suggestions_with_preset,
+        AiConfig, DEFAULT_BASE_API_URL, DiffExplanation, SplitCommitPlan, build_commit_prompt,
+        build_diff_explanation_prompt, build_heuristic_commit_options,
+        build_heuristic_commit_suggestions, normalize_base_api_url, parse_commit_options,
+        parse_commit_suggestions, parse_commit_suggestions_with_preset, parse_diff_explanation,
         truncate_diff, validate_commit_message, validate_commit_message_with_preset,
     };
-    use crate::config::{CommitStyle, Provider, ResolvedConventionalPreset};
+    use crate::config::{CommitStyle, GenerationMode, Provider, ResolvedConventionalPreset};
 
     fn default_preset() -> ResolvedConventionalPreset {
         ResolvedConventionalPreset::built_in_default()
@@ -1171,6 +1440,7 @@ mod tests {
             DEFAULT_BASE_API_URL,
             "   ",
             CommitStyle::Standard,
+            GenerationMode::Auto,
             default_preset(),
         )
         .unwrap_err();
@@ -1233,6 +1503,23 @@ mod tests {
     }
 
     #[test]
+    fn includes_requested_sections_in_diff_explanation_prompt() {
+        let prompt = build_diff_explanation_prompt(&super::PromptInput {
+            branch: "main".into(),
+            staged_files: vec!["src/main.rs".into()],
+            diff_stat: "1 file changed".into(),
+            diff: "diff --git".into(),
+            commit_style: CommitStyle::Standard,
+            conventional_preset: default_preset(),
+        });
+
+        assert!(prompt.contains("what changed"));
+        assert!(prompt.contains("possible intent"));
+        assert!(prompt.contains("risk areas"));
+        assert!(prompt.contains("test suggestions"));
+    }
+
+    #[test]
     fn supports_test_timeout_override() {
         let config = AiConfig::new(
             "token".into(),
@@ -1240,6 +1527,7 @@ mod tests {
             DEFAULT_BASE_API_URL,
             "model",
             CommitStyle::Standard,
+            GenerationMode::Auto,
             default_preset(),
         )
         .unwrap()
@@ -1302,6 +1590,26 @@ mod tests {
         assert_eq!(
             suggestions.split[0].files,
             vec!["src/billing.rs".to_string()]
+        );
+    }
+
+    #[test]
+    fn parses_diff_explanation_json() {
+        let explanation = parse_diff_explanation(
+            r#"{"what_changed":["Adds a new explain command"],"possible_intent":["Help users understand staged diffs before committing"],"risk_areas":["Prompt output could become too verbose"],"test_suggestions":["Cover the AI parser with a mocked response"]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            explanation,
+            DiffExplanation {
+                what_changed: vec!["Adds a new explain command".to_string()],
+                possible_intent: vec![
+                    "Help users understand staged diffs before committing".to_string()
+                ],
+                risk_areas: vec!["Prompt output could become too verbose".to_string()],
+                test_suggestions: vec!["Cover the AI parser with a mocked response".to_string()],
+            }
         );
     }
 
@@ -1385,6 +1693,38 @@ mod tests {
 
         assert_eq!(options[0], "Update release workflow");
         assert_eq!(options.len(), 3);
+    }
+
+    #[test]
+    fn builds_contextual_timeout_fallback_options() {
+        let options = build_heuristic_commit_options(&super::PromptInput {
+            branch: "main".into(),
+            staged_files: vec!["src/ai.rs".into()],
+            diff_stat: "1 file changed".into(),
+            diff: "diff --git a/src/ai.rs b/src/ai.rs\n+retry request before fallback\n+handle timeout explicitly".into(),
+            commit_style: CommitStyle::Standard,
+            conventional_preset: default_preset(),
+        });
+
+        assert_eq!(options[0], "Retry ai generation before fallback");
+        assert_eq!(options[1], "Reduce ai fallback usage");
+        assert_eq!(options[2], "Improve ai timeout recovery");
+    }
+
+    #[test]
+    fn ignores_diff_headers_when_building_fallback_options() {
+        let options = build_heuristic_commit_options(&super::PromptInput {
+            branch: "main".into(),
+            staged_files: vec!["src/fallback.rs".into()],
+            diff_stat: "1 file changed".into(),
+            diff: "diff --git a/src/fallback.rs b/src/fallback.rs\nnew file mode 100644\n--- /dev/null\n+++ b/src/fallback.rs\n+fn render() {}\n".into(),
+            commit_style: CommitStyle::Standard,
+            conventional_preset: default_preset(),
+        });
+
+        assert_eq!(options[0], "Improve fallback");
+        assert_eq!(options[1], "Refine fallback behavior");
+        assert_eq!(options[2], "Clean up fallback flow");
     }
 
     #[test]

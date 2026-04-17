@@ -9,6 +9,8 @@
 ## Features
 
 - Generate 1-3 commit message options from the staged diff
+- Use `auto`, `ai-only`, or `heuristic-only` commit generation modes
+- Explain the staged diff with what changed, likely intent, risks, and test ideas
 - Detect mixed staged concerns and let you approve file-based split commits in the TUI
 - Choose an option in the TUI and edit it inline before committing
 - Support standard and Conventional Commits styles, including configurable presets
@@ -23,7 +25,7 @@
 
 - Rust toolchain
 - `git` installed and available on `PATH`
-- An API token for your OpenAI-compatible provider
+- An API token for AI-backed commit generation or `gg explain`
 
 ## Configuration
 
@@ -38,6 +40,7 @@ cargo run --bin gg -- config
 What this does:
 
 - lets you choose `gemini` or `openai-compatible`
+- lets you choose `auto`, `ai-only`, or `heuristic-only` commit generation
 - stores the API token in the system keychain
 - stores non-secret defaults in the standard per-user config directory
 - keeps environment variables available for one-off overrides
@@ -74,6 +77,7 @@ You can also define custom team presets in the config file and select one with:
 
 ```bash
 gg config set conventional-preset team
+gg config set generation-mode heuristic-only
 gg config unset conventional-preset
 ```
 
@@ -81,6 +85,7 @@ Example config:
 
 ```toml
 commit_style = "conventional"
+generation_mode = "auto"
 
 [conventional_commits]
 preset = "team"
@@ -98,9 +103,11 @@ cargo run --bin gg -- --help
 cargo run --bin gg -- config
 cargo run --bin gg -- config show
 cargo run --bin gg -- config set conventional-preset team
+cargo run --bin gg -- config set generation-mode ai-only
 cargo run --bin gg -- auth status
 cargo run --bin gg -- doctor
 cargo run --bin gg -- commit
+cargo run --bin gg -- explain
 cargo run --bin gg -- push
 cargo run --bin gg -- status --short
 cargo run --bin gg -- log --oneline -5
@@ -113,6 +120,7 @@ After building:
 cargo build --release
 ./target/release/gg
 ./target/release/gg commit
+./target/release/gg explain
 ./target/release/gg push
 ```
 
@@ -177,7 +185,10 @@ gg git push --force-with-lease
 - requires staged changes
 - reads the staged diff
 - warns before generation when the staged diff looks unsafe, including `.env` secrets, private keys, huge generated files, minified blobs, lockfile-only changes, and console.log spam
-- asks the configured AI provider for 1-3 commit message options
+- uses the configured generation mode:
+  - `auto`: asks the configured AI provider for 1-3 commit message options and falls back to heuristic options on timeout
+  - `ai-only`: asks the configured AI provider and surfaces provider errors instead of falling back
+  - `heuristic-only`: skips the AI provider and generates local heuristic options only
 - shortens overlong AI-generated subjects to fit the 72-character subject limit
 - shows when the staged diff looks like multiple concerns and offers a file-based split commit plan in the TUI
 - lets you choose one option in the TUI
@@ -195,6 +206,17 @@ Keys:
 - `Enter` confirm commit
 - `Esc` cancel
 - `Ctrl-S` leave edit mode
+
+### `gg explain`
+
+- requires staged changes
+- reads the staged diff
+- asks the configured AI provider to explain the change in four sections
+- prints:
+  - what changed
+  - possible intent
+  - risk areas
+  - test suggestions
 
 ### `gg push`
 
@@ -214,6 +236,7 @@ Keys:
   - `BASE_MODEL`
   - `API_TOKEN`
   - commit style preference
+  - commit generation mode: `auto`, `ai-only`, or `heuristic-only`
   - active Conventional Commit preset selection
 - stores non-secret settings in the config file
 - stores `API_TOKEN` in the system keychain
@@ -225,7 +248,7 @@ Checks:
 
 - `git` availability
 - whether the current directory is a Git repository
-- AI token availability
+- AI token availability when AI-backed features are configured
 - provider, config, and override resolution
 - reachability of `BASE_API_URL`
 

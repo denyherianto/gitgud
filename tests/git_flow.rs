@@ -1,6 +1,7 @@
 use std::{fs, path::Path, process::Command};
 
-use gitgud::ai::SplitCommitPlan;
+use gitgud::ai::{PromptInput, SplitCommitPlan, build_heuristic_commit_options};
+use gitgud::config::{CommitStyle, ResolvedConventionalPreset};
 use gitgud::git::{GitRepo, PushPlan, UnsafeDiffWarning};
 use tempfile::TempDir;
 
@@ -92,6 +93,46 @@ fn warns_for_staged_secret_env_files() {
             .iter()
             .any(|message| message.contains("Potential secrets added in .env files"))
     );
+}
+
+#[test]
+fn heuristic_fallback_ignores_unstaged_changes() {
+    let repo_dir = init_repo();
+    fs::create_dir_all(repo_dir.path().join("src")).unwrap();
+    fs::write(
+        repo_dir.path().join("src/main.rs"),
+        "fn main() {\n    println!(\"hello\");\n}\n",
+    )
+    .unwrap();
+    run(repo_dir.path(), &["add", "src/main.rs"]);
+    run(repo_dir.path(), &["commit", "-m", "Add main"]);
+
+    fs::write(
+        repo_dir.path().join("src/main.rs"),
+        "fn main() {\n    println!(\"goodbye\");\n}\n",
+    )
+    .unwrap();
+    run(repo_dir.path(), &["add", "src/main.rs"]);
+    fs::write(
+        repo_dir.path().join("notes.txt"),
+        "retry timeout fallback if generation fails\n",
+    )
+    .unwrap();
+
+    let repo = GitRepo::new(repo_dir.path());
+    let staged = repo.staged_changes().unwrap();
+    let options = build_heuristic_commit_options(&PromptInput {
+        branch: repo.current_branch().unwrap(),
+        staged_files: staged.staged_files,
+        diff_stat: staged.diff_stat,
+        diff: staged.diff,
+        commit_style: CommitStyle::Standard,
+        conventional_preset: ResolvedConventionalPreset::built_in_default(),
+    });
+
+    assert_eq!(options[0], "Improve main");
+    assert_eq!(options[1], "Refine main behavior");
+    assert_eq!(options[2], "Clean up main flow");
 }
 
 #[test]

@@ -5,10 +5,10 @@ use clap::Parser;
 use rpassword::prompt_password;
 
 use crate::{
-    ai::{AiClient, AiConfig},
+    ai::{AiClient, AiConfig, DiffExplanation, PromptInput},
     cli::{AuthCommand, Cli, Command, ConfigCommand},
     config::{
-        TokenStatus, config_path, delete_api_token, load_file, resolve_ai_settings,
+        GenerationMode, TokenStatus, config_path, delete_api_token, load_file, resolve_ai_settings,
         resolve_non_secret_settings, save_file_to_path, set_config_value, store_api_token,
         token_status, unset_config_value,
     },
@@ -32,6 +32,7 @@ pub async fn run() -> Result<()> {
 
     match command {
         Command::Commit => run_commit(&repo).await,
+        Command::Explain => run_explain(&repo).await,
         Command::Push => run_push(&repo),
         Command::Git { args } => run_git_passthrough(&repo, &args),
         Command::Passthrough(args) => run_git_passthrough(&repo, &args),
@@ -81,13 +82,21 @@ async fn run_commit(repo: &GitRepo) -> Result<()> {
         return Ok(());
     }
 
-    let config = AiConfig::load()?;
-    let client = AiClient::new(config.clone())?;
+    let settings = resolve_non_secret_settings()?;
+    let generator = match settings.generation_mode.value {
+        GenerationMode::HeuristicOnly => tui::CommitGenerator::HeuristicOnly,
+        GenerationMode::Auto | GenerationMode::AiOnly => {
+            let config = AiConfig::load()?;
+            tui::CommitGenerator::Ai(AiClient::new(config)?)
+        }
+    };
+
     match tui::run_commit(
         repo,
-        client,
-        config.commit_style,
-        config.conventional_preset,
+        generator,
+        settings.commit_style.value,
+        settings.generation_mode.value,
+        settings.conventional_preset.value,
     )
     .await?
     {
@@ -118,6 +127,35 @@ async fn run_commit(repo: &GitRepo) -> Result<()> {
             Ok(())
         }
     }
+}
+
+async fn run_explain(repo: &GitRepo) -> Result<()> {
+    repo.ensure_git_available()?;
+    repo.ensure_repo()?;
+
+    let staged = repo.staged_changes()?;
+    if staged.staged_files.is_empty() {
+        let message = "No staged changes found. Stage files before explaining the diff.";
+        tui::show_message("Cannot Explain Diff", message)?;
+        bail!(message);
+    }
+
+    let config = AiConfig::load()?;
+    let input = PromptInput {
+        branch: repo
+            .branch_name()?
+            .unwrap_or_else(|| "DETACHED".to_string()),
+        staged_files: staged.staged_files,
+        diff_stat: staged.diff_stat,
+        diff: staged.diff,
+        commit_style: config.commit_style,
+        conventional_preset: config.conventional_preset.clone(),
+    };
+    let client = AiClient::new(config)?;
+    let explanation = client.generate_diff_explanation(&input).await?;
+
+    print_diff_explanation(&explanation);
+    Ok(())
 }
 
 fn run_push(repo: &GitRepo) -> Result<()> {
@@ -162,6 +200,23 @@ fn run_push(repo: &GitRepo) -> Result<()> {
             }
             Ok(())
         }
+    }
+}
+
+fn print_diff_explanation(explanation: &DiffExplanation) {
+    print_diff_explanation_section("What Changed", &explanation.what_changed);
+    println!();
+    print_diff_explanation_section("Possible Intent", &explanation.possible_intent);
+    println!();
+    print_diff_explanation_section("Risk Areas", &explanation.risk_areas);
+    println!();
+    print_diff_explanation_section("Test Suggestions", &explanation.test_suggestions);
+}
+
+fn print_diff_explanation_section(title: &str, items: &[String]) {
+    println!("{title}:");
+    for item in items {
+        println!("- {item}");
     }
 }
 
@@ -210,6 +265,13 @@ fn run_config(command: Option<ConfigCommand>) -> Result<()> {
                     .unwrap_or_else(|| "(not set)".to_string())
             );
             println!(
+                "Stored generation_mode: {}",
+                stored
+                    .generation_mode
+                    .map(|generation_mode| generation_mode.to_string())
+                    .unwrap_or_else(|| "(not set)".to_string())
+            );
+            println!(
                 "Stored conventional_preset: {}",
                 stored
                     .conventional_commits
@@ -232,6 +294,10 @@ fn run_config(command: Option<ConfigCommand>) -> Result<()> {
             println!(
                 "Effective commit_style: {} ({})",
                 non_secret.commit_style.value, non_secret.commit_style.source
+            );
+            println!(
+                "Effective generation_mode: {} ({})",
+                non_secret.generation_mode.value, non_secret.generation_mode.source
             );
             println!(
                 "Effective conventional_preset: {} ({})",
@@ -278,6 +344,7 @@ fn run_config_setup() -> Result<()> {
         base_api_url: resolved.base_api_url.value,
         base_model: resolved.base_model.value,
         commit_style: resolved.commit_style.value,
+        generation_mode: resolved.generation_mode.value,
         token_status: current_token_status.clone(),
         token_present: !matches!(current_token_status, TokenStatus::Missing),
     };
@@ -287,6 +354,7 @@ fn run_config_setup() -> Result<()> {
         base_api_url,
         base_model,
         commit_style,
+        generation_mode,
         api_token,
     }) = tui::run_config_setup(input)?
     else {
@@ -304,6 +372,7 @@ fn run_config_setup() -> Result<()> {
     config.base_api_url = Some(base_api_url);
     config.base_model = Some(base_model.to_string());
     config.commit_style = Some(commit_style);
+    config.generation_mode = Some(generation_mode);
     save_file_to_path(&path, &config)?;
 
     if let Some(token) = api_token {
@@ -357,6 +426,7 @@ fn config_key_name(key: crate::cli::ConfigKey) -> &'static str {
         crate::cli::ConfigKey::BaseApiUrl => "base-api-url",
         crate::cli::ConfigKey::BaseModel => "base-model",
         crate::cli::ConfigKey::CommitStyle => "commit-style",
+        crate::cli::ConfigKey::GenerationMode => "generation-mode",
         crate::cli::ConfigKey::ConventionalPreset => "conventional-preset",
     }
 }
@@ -380,9 +450,8 @@ async fn run_doctor(repo: &GitRepo) -> Result<()> {
         }
     }
 
-    match resolve_ai_settings() {
+    match resolve_non_secret_settings() {
         Ok(resolved) => {
-            println!("[ok] AI token available from {}", resolved.api_token.source);
             println!("[ok] provider resolved from {}", resolved.provider.source);
             println!(
                 "[ok] BASE_API_URL resolved from {}",
@@ -397,30 +466,55 @@ async fn run_doctor(repo: &GitRepo) -> Result<()> {
                 resolved.commit_style.source
             );
             println!(
+                "[ok] generation mode resolved from {}",
+                resolved.generation_mode.source
+            );
+            println!(
                 "[ok] conventional preset resolved from {}",
                 resolved.conventional_preset.source
             );
+            match resolve_ai_settings() {
+                Ok(ai_resolved) => {
+                    println!(
+                        "[ok] AI token available from {}",
+                        ai_resolved.api_token.source
+                    );
 
-            let config = AiConfig::load()?;
-            match AiClient::new(config.clone())?.check_reachability().await {
-                Ok(status) => println!("[ok] BASE_API_URL reachable (HTTP {status})"),
+                    let config = AiConfig::load()?;
+                    match AiClient::new(config.clone())?.check_reachability().await {
+                        Ok(status) => println!("[ok] BASE_API_URL reachable (HTTP {status})"),
+                        Err(error) => {
+                            failures += 1;
+                            println!("[fail] BASE_API_URL reachability: {error}");
+                        }
+                    }
+                    println!("[ok] provider set to {}", config.provider);
+                    println!("[ok] BASE_MODEL set to {}", config.base_model);
+                    println!("[ok] commit style set to {}", config.commit_style);
+                    println!("[ok] generation mode set to {}", config.generation_mode);
+                    println!(
+                        "[ok] conventional preset set to {} [{}]",
+                        config.conventional_preset.name,
+                        config.conventional_preset.types.join(", ")
+                    );
+                }
+                Err(error)
+                    if matches!(
+                        resolved.generation_mode.value,
+                        GenerationMode::HeuristicOnly
+                    ) && error.to_string().contains("missing API token") =>
+                {
+                    println!("[ok] AI token not required for heuristic-only commit generation");
+                }
                 Err(error) => {
                     failures += 1;
-                    println!("[fail] BASE_API_URL reachability: {error}");
+                    println!("[fail] AI configuration: {error}");
                 }
             }
-            println!("[ok] provider set to {}", config.provider);
-            println!("[ok] BASE_MODEL set to {}", config.base_model);
-            println!("[ok] commit style set to {}", config.commit_style);
-            println!(
-                "[ok] conventional preset set to {} [{}]",
-                config.conventional_preset.name,
-                config.conventional_preset.types.join(", ")
-            );
         }
         Err(error) => {
             failures += 1;
-            println!("[fail] AI configuration: {error}");
+            println!("[fail] configuration: {error}");
         }
     }
 
