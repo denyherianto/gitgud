@@ -176,6 +176,7 @@ gg git push --force-with-lease
 
 - requires staged changes
 - reads the staged diff
+- warns before generation when the staged diff looks unsafe, including `.env` secrets, private keys, huge generated files, minified blobs, lockfile-only changes, and console.log spam
 - asks the configured AI provider for 1-3 commit message options
 - shortens overlong AI-generated subjects to fit the 72-character subject limit
 - shows when the staged diff looks like multiple concerns and offers a file-based split commit plan in the TUI
@@ -199,6 +200,7 @@ Keys:
 
 - detects the current branch
 - checks whether an upstream already exists
+- warns before pushing when the outgoing diff looks unsafe, using the same secret, generated-file, minified-blob, lockfile-only, and console.log checks
 - pushes immediately when the target is unambiguous
 - offers `--force-with-lease` only after explicit confirmation if the normal push is rejected
 - errors when the first push target is ambiguous instead of guessing across multiple remotes

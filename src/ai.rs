@@ -1,10 +1,10 @@
 use std::{collections::BTreeMap, time::Duration};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{resolve_ai_settings, CommitStyle, Provider, ResolvedConventionalPreset};
+use crate::config::{CommitStyle, Provider, ResolvedConventionalPreset, resolve_ai_settings};
 
 pub const DEFAULT_PROVIDER: Provider = Provider::Gemini;
 pub const DEFAULT_BASE_API_URL: &str = "https://generativelanguage.googleapis.com/v1beta/openai";
@@ -1146,10 +1146,10 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        build_commit_prompt, build_heuristic_commit_options, build_heuristic_commit_suggestions,
-        normalize_base_api_url, parse_commit_options, parse_commit_suggestions,
-        parse_commit_suggestions_with_preset, truncate_diff, validate_commit_message,
-        validate_commit_message_with_preset, AiConfig, SplitCommitPlan, DEFAULT_BASE_API_URL,
+        AiConfig, DEFAULT_BASE_API_URL, SplitCommitPlan, build_commit_prompt,
+        build_heuristic_commit_options, build_heuristic_commit_suggestions, normalize_base_api_url,
+        parse_commit_options, parse_commit_suggestions, parse_commit_suggestions_with_preset,
+        truncate_diff, validate_commit_message, validate_commit_message_with_preset,
     };
     use crate::config::{CommitStyle, Provider, ResolvedConventionalPreset};
 
@@ -1326,10 +1326,12 @@ mod tests {
         .unwrap();
 
         assert_eq!(suggestions.split.len(), 2);
-        assert!(suggestions
-            .split
-            .iter()
-            .all(|plan| plan.message.chars().count() <= 72));
+        assert!(
+            suggestions
+                .split
+                .iter()
+                .all(|plan| plan.message.chars().count() <= 72)
+        );
     }
 
     #[test]

@@ -27,7 +27,7 @@ use crate::{
         validate_commit_message_with_preset,
     },
     config::{CommitStyle, Provider, ResolvedConventionalPreset, TokenStatus},
-    git::{GitRepo, PushPlan, RepoStatus},
+    git::{GitRepo, PushPlan, RepoStatus, UnsafeDiffWarning},
 };
 
 type Backend = CrosstermBackend<Stdout>;
@@ -132,6 +132,13 @@ pub fn confirm_stage_all_changes() -> Result<bool> {
 
 pub fn confirm_split_commits(plans: &[SplitCommitPlan]) -> Result<bool> {
     with_terminal(|terminal| split_commit_confirm_loop(terminal, plans))
+}
+
+pub fn confirm_unsafe_diff_warnings(
+    action_label: &str,
+    warnings: &[UnsafeDiffWarning],
+) -> Result<bool> {
+    with_terminal(|terminal| unsafe_diff_warning_loop(terminal, action_label, warnings))
 }
 
 pub fn show_message(title: &str, message: &str) -> Result<()> {
@@ -241,6 +248,24 @@ fn split_commit_confirm_loop(
 ) -> Result<bool> {
     loop {
         terminal.draw(|frame| draw_split_commit_confirm(frame, plans))?;
+
+        if let Event::Key(key) = event::read()? {
+            match key.code {
+                KeyCode::Enter => return Ok(true),
+                KeyCode::Esc => return Ok(false),
+                _ => {}
+            }
+        }
+    }
+}
+
+fn unsafe_diff_warning_loop(
+    terminal: &mut AppTerminal,
+    action_label: &str,
+    warnings: &[UnsafeDiffWarning],
+) -> Result<bool> {
+    loop {
+        terminal.draw(|frame| draw_unsafe_diff_warning(frame, action_label, warnings))?;
 
         if let Event::Key(key) = event::read()? {
             match key.code {
@@ -706,6 +731,26 @@ fn draw_split_commit_confirm(frame: &mut ratatui::Frame<'_>, plans: &[SplitCommi
     lines.push("Press Enter to create these split commits, or Esc to cancel.".to_string());
 
     draw_message(frame, "Split Commit Confirmation", &lines.join("\n"));
+}
+
+fn draw_unsafe_diff_warning(
+    frame: &mut ratatui::Frame<'_>,
+    action_label: &str,
+    warnings: &[UnsafeDiffWarning],
+) {
+    let mut lines = vec![
+        format!("Suspicious diff patterns were detected before {action_label}."),
+        String::new(),
+    ];
+    for warning in warnings {
+        lines.push(format!("- {}", warning.message));
+    }
+    lines.push(String::new());
+    lines.push(format!(
+        "Press Enter to continue with {action_label}, or Esc to cancel."
+    ));
+
+    draw_message(frame, "Unsafe Diff Warning", &lines.join("\n"));
 }
 
 fn draw_message(frame: &mut ratatui::Frame<'_>, title: &str, message: &str) {

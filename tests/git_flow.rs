@@ -1,7 +1,7 @@
 use std::{fs, path::Path, process::Command};
 
 use gitgud::ai::SplitCommitPlan;
-use gitgud::git::{GitRepo, PushPlan};
+use gitgud::git::{GitRepo, PushPlan, UnsafeDiffWarning};
 use tempfile::TempDir;
 
 fn run(dir: &Path, args: &[&str]) -> String {
@@ -31,6 +31,13 @@ fn init_repo() -> TempDir {
     run(temp.path(), &["add", "README.md"]);
     run(temp.path(), &["commit", "-m", "Initial commit"]);
     temp
+}
+
+fn warning_messages(warnings: Vec<UnsafeDiffWarning>) -> Vec<String> {
+    warnings
+        .into_iter()
+        .map(|warning| warning.message)
+        .collect()
 }
 
 #[test]
@@ -69,6 +76,22 @@ fn stages_all_changes_when_requested() {
 
     assert!(staged.staged_files.iter().any(|path| path == "README.md"));
     assert!(staged.staged_files.iter().any(|path| path == "notes.txt"));
+}
+
+#[test]
+fn warns_for_staged_secret_env_files() {
+    let repo_dir = init_repo();
+    fs::write(repo_dir.path().join(".env"), "API_TOKEN=super-secret\n").unwrap();
+    run(repo_dir.path(), &["add", ".env"]);
+
+    let repo = GitRepo::new(repo_dir.path());
+    let warnings = warning_messages(repo.staged_diff_warnings().unwrap());
+
+    assert!(
+        warnings
+            .iter()
+            .any(|message| message.contains("Potential secrets added in .env files"))
+    );
 }
 
 #[test]
@@ -278,4 +301,30 @@ fn detects_detached_head_for_push() {
     let repo = GitRepo::new(repo_dir.path());
     let error = repo.plan_push().unwrap_err();
     assert!(error.to_string().contains("detached HEAD"));
+}
+
+#[test]
+fn warns_for_outgoing_lockfile_only_pushes() {
+    let bare = TempDir::new().unwrap();
+    run(bare.path(), &["init", "--bare"]);
+    let repo_dir = init_repo();
+    run(
+        repo_dir.path(),
+        &["remote", "add", "origin", bare.path().to_str().unwrap()],
+    );
+    run(repo_dir.path(), &["push", "-u", "origin", "main"]);
+
+    fs::write(repo_dir.path().join("Cargo.lock"), "# updated lockfile\n").unwrap();
+    run(repo_dir.path(), &["add", "Cargo.lock"]);
+    run(repo_dir.path(), &["commit", "-m", "Update lockfile"]);
+
+    let repo = GitRepo::new(repo_dir.path());
+    let plan = repo.plan_push().unwrap();
+    let warnings = warning_messages(repo.push_diff_warnings(&plan).unwrap());
+
+    assert!(
+        warnings
+            .iter()
+            .any(|message| message.contains("Only lockfiles changed"))
+    );
 }

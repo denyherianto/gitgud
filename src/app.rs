@@ -73,6 +73,14 @@ async fn run_commit(repo: &GitRepo) -> Result<()> {
         }
     }
 
+    let warnings = repo.staged_diff_warnings()?;
+    if !warnings.is_empty()
+        && !tui::confirm_unsafe_diff_warnings("generating commit messages", &warnings)?
+    {
+        println!("commit cancelled");
+        return Ok(());
+    }
+
     let config = AiConfig::load()?;
     let client = AiClient::new(config.clone())?;
     match tui::run_commit(
@@ -120,6 +128,11 @@ fn run_push(repo: &GitRepo) -> Result<()> {
         tui::show_message("Cannot Push", &error.to_string())?;
         Err(error)
     })?;
+    let warnings = repo.push_diff_warnings(&plan)?;
+    if !warnings.is_empty() && !tui::confirm_unsafe_diff_warnings("pushing", &warnings)? {
+        println!("push cancelled");
+        return Ok(());
+    }
 
     match repo.push(&plan) {
         Ok(output) => {
