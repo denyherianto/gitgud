@@ -24,6 +24,27 @@
 - Route bare natural language input (unrecognized as a Git subcommand) automatically to `ask`
 - Validate local setup with a `doctor` command
 
+## Commands
+
+| Command | Description |
+|---------|-------------|
+| `gg` | Open the home TUI — shows branch, staged/unstaged counts, and remote status |
+| `gg commit` | Generate 1–3 AI commit message options from the staged diff and commit after selection |
+| `gg explain` | Explain the staged diff: what changed, likely intent, risk areas, and test suggestions |
+| `gg push` | Push the current branch; offers `--force-with-lease` only after explicit confirmation |
+| `gg ask <query>` | Describe what you want in plain English and get exact Git command(s) with risk ratings and alternatives |
+| `gg config` | Open the interactive setup screen to configure provider, model, token, and commit style |
+| `gg config show` | Print the resolved configuration and its sources |
+| `gg config set <key> <value>` | Set a single config value (e.g. `commit-style`, `generation-mode`, `conventional-preset`) |
+| `gg config unset <key>` | Remove a config value and fall back to the default |
+| `gg auth login` | Store an API token in the system keychain |
+| `gg auth status` | Show whether an API token is available and where it comes from |
+| `gg auth logout` | Remove the stored API token from the keychain |
+| `gg doctor` | Check git availability, repo state, AI token, config resolution, and provider reachability |
+| `gg git <args>` | Pass a command straight to `git`, bypassing `gg` routing (e.g. `gg git commit --amend`) |
+| `gg <git-subcommand>` | Unknown subcommands that match a known Git name are passed through directly |
+| `gg <natural language>` | Unrecognized input that does not match a Git subcommand is routed to `gg ask` automatically |
+
 ## Requirements
 
 - Rust toolchain
