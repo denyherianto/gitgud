@@ -52,6 +52,9 @@ jobs:
           - name: Linux x86_64
             runner: ubuntu-24.04
             archive_name: gg-linux-x86_64
+          - name: Windows x86_64
+            runner: windows-latest
+            archive_name: gg-windows-x86_64
 
     steps:
       - name: Check out source
@@ -69,18 +72,28 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked
 
-      - name: Package release archive
+      - name: Package release archive (Unix)
+        if: runner.os != 'Windows'
         run: |
           mkdir -p dist
           cp "target/release/${BIN_NAME}" "${BIN_NAME}"
           tar -czf "dist/${{ matrix.archive_name }}.tar.gz" "${BIN_NAME}"
           rm -f "${BIN_NAME}"
 
+      - name: Package release archive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "target/release/${env:BIN_NAME}.exe" "${env:BIN_NAME}.exe"
+          Compress-Archive -Path "${env:BIN_NAME}.exe" -DestinationPath "dist/${{ matrix.archive_name }}.zip" -Force
+          Remove-Item "${env:BIN_NAME}.exe"
+
       - name: Upload packaged artifact
         uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.archive_name }}
-          path: dist/${{ matrix.archive_name }}.tar.gz
+          path: dist/${{ matrix.archive_name }}.*
           if-no-files-found: error
 
   publish:
@@ -103,7 +116,7 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           if gh release view "${TAG}" >/dev/null 2>&1; then
-            gh release upload "${TAG}" dist/*.tar.gz --clobber
+            gh release upload "${TAG}" dist/* --clobber
           else
-            gh release create "${TAG}" dist/*.tar.gz --verify-tag --generate-notes
+            gh release create "${TAG}" dist/* --verify-tag --generate-notes
           fi
