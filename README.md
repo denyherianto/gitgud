@@ -1,32 +1,39 @@
 # gitgud
 
-`gitgud` is a Rust CLI that adds a terminal UI and AI-assisted workflows on top of normal Git commands.
+`gitgud` is a Rust CLI that adds a terminal UI and AI-assisted Git workflows on top of normal Git.
 
 <p align="center">
   <img src="./assets/gitgud-mascot.jpg" alt="gitgud repo mascot" width="280">
 </p>
 
+## What It Does
+
+- Generates 1-3 commit message options from the staged diff
+- Explains staged changes with intent, risks, and test ideas
+- Suggests exact Git commands from natural language requests
+- Pushes the current branch with explicit confirmation before `--force-with-lease`
+- Supports standard commits and Conventional Commits presets
+- Uses Gemini by default, or any OpenAI-compatible API including Ollama
+
 ## Install
 
-Install the latest GitHub release:
+Latest release:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/denyherianto/gitgud/main/install.sh | sh
 ```
 
-Install a specific release:
+Specific release:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/denyherianto/gitgud/main/install.sh | sh -s -- --version v0.1.0
 ```
 
-The installer expects GitHub release assets named like:
+Requirements:
 
-- `gg-darwin-arm64.tar.gz`
-- `gg-darwin-x86_64.tar.gz`
-- `gg-linux-arm64.tar.gz`
-- `gg-linux-x86_64.tar.gz`
-- `gg-windows-x86_64.zip`
+- `git` on `PATH`
+- Rust toolchain if building from source
+- An API token for AI-backed features unless you use `heuristic-only` mode
 
 ## Features
 
@@ -46,78 +53,86 @@ The installer expects GitHub release assets named like:
 - Route bare natural language input (unrecognized as a Git subcommand) automatically to `ask`
 - Validate local setup with a `doctor` command
 
-## Commands
-
-| Command | Description |
-|---------|-------------|
-| `gg` | Open the home TUI — shows branch, staged/unstaged counts, and remote status |
-| `gg commit` | Generate 1–3 AI commit message options from the staged diff and commit after selection |
-| `gg explain` | Explain the staged diff: what changed, likely intent, risk areas, and test suggestions |
-| `gg push` | Push the current branch; offers `--force-with-lease` only after explicit confirmation |
-| `gg ask <query>` | Describe what you want in plain English and get exact Git command(s) with risk ratings and alternatives |
-| `gg config` | Open the interactive setup screen to configure provider, token, model, and commit style |
-| `gg config show` | Print the resolved configuration and its sources |
-| `gg config set <key> <value>` | Set a single config value (e.g. `commit-style`, `generation-mode`, `conventional-preset`) |
-| `gg config unset <key>` | Remove a config value and fall back to the default |
-| `gg auth login` | Store an API token in the system keychain |
-| `gg auth status` | Show whether an API token is available and where it comes from |
-| `gg auth logout` | Remove the stored API token from the keychain |
-| `gg doctor` | Check git availability, repo state, AI token, config resolution, and provider reachability |
-| `gg git <args>` | Pass a command straight to `git`, bypassing `gg` routing (e.g. `gg git commit --amend`) |
-| `gg <git-subcommand>` | Unknown subcommands that match a known Git name are passed through directly |
-| `gg <natural language>` | Unrecognized input that does not match a Git subcommand is routed to `gg ask` automatically |
-
-## Requirements
-
-- Rust toolchain
-- `git` installed and available on `PATH`
-- An API token for AI-backed commit generation or `gg explain`
-
-## Configuration
-
-`gitgud` supports persistent global config plus secure token storage.
-
-Recommended setup:
-
-```bash
-cargo run --bin gg -- config
-```
-
-What this does:
-
-- lets you choose `gemini` or `openai-compatible`
-- lets you open provider-reported model options with `Enter`, navigate them with `Up`/`Down`, and apply one with `Enter` after `BASE_API_URL` and `API_TOKEN` are available
-- lets you choose `auto`, `ai-only`, or `heuristic-only` commit generation
-- stores the API token in the system keychain
-- stores non-secret defaults in the standard per-user config directory
-- keeps environment variables available for one-off overrides
-
-Use `gg config show` to see the exact config file path on your platform.
-
-Current precedence:
-
-1. Environment variables
-2. Global config file
-3. Built-in defaults
-
-Supported environment overrides:
-
-- `API_TOKEN`
-- `BASE_API_URL`
-- `BASE_MODEL`
-- `AI_TIMEOUT_SECS` — override the AI request timeout (default: 60 seconds); useful for slow or remote providers
-
-### BYOK Quick Start
-
-Bring your own key by pointing `gitgud` at the provider you want and storing that provider's API token.
+## Quick Start
 
 Interactive setup:
 
 ```bash
 gg config
+gg doctor
 ```
 
-Direct CLI setup for an OpenAI-compatible provider:
+Typical usage:
+
+```bash
+gg commit
+gg explain
+gg push
+gg ask "undo last commit but keep changes"
+gg "unstage package.json"
+```
+
+Build from source:
+
+```bash
+cargo run --bin gg -- --help
+cargo run --bin gg -- config
+cargo run --bin gg -- commit
+```
+
+## Commands
+
+| Command | Description |
+|---------|-------------|
+| `gg` | Open the home TUI with branch, staged/unstaged counts, and remote status |
+| `gg commit` | Generate commit options from staged changes and commit after confirmation |
+| `gg explain` | Explain the staged diff in four sections |
+| `gg push` | Push the current branch and offer `--force-with-lease` only after confirmation |
+| `gg ask <query>` | Turn a natural language Git request into exact command(s) with risk guidance |
+| `gg config` | Open the interactive setup screen |
+| `gg config show` | Print effective config values and their sources |
+| `gg config set <key> <value>` | Persist one config value |
+| `gg config unset <key>` | Remove one persisted config value |
+| `gg auth login` | Store an API token in the system keychain |
+| `gg auth status` | Show whether an API token is available and where it comes from |
+| `gg auth logout` | Remove the stored API token from the keychain |
+| `gg doctor` | Check Git, repo state, token availability, config resolution, and provider reachability |
+| `gg git <args>` | Pass a command straight to raw Git |
+| `gg <git-subcommand>` | Unknown Git subcommands are passed through directly |
+| `gg <natural language>` | Unrecognized input that is not a Git subcommand is routed to `ask` |
+
+## AI Setup
+
+`gitgud` stores non-secret settings in a per-user config file and stores `API_TOKEN` in the system keychain.
+
+Config precedence:
+
+1. Environment variables
+2. Global config file
+3. Built-in defaults
+
+Environment overrides:
+
+- `API_TOKEN`
+- `BASE_API_URL`
+- `BASE_MODEL`
+- `AI_TIMEOUT_SECS` default `60`
+
+Interactive setup supports:
+
+- provider: `gemini` or `openai-compatible`
+- `BASE_API_URL`
+- `BASE_MODEL`
+- `API_TOKEN`
+- commit style: `standard` or `conventional`
+- generation mode: `auto`, `ai-only`, or `heuristic-only`
+- provider model loading from `/models` after `BASE_API_URL` and `API_TOKEN` are set
+
+Use `gg config show` to print the exact config path and the source of each effective value.
+
+### BYOK
+
+OpenAI-compatible example:
 
 ```bash
 gg config set provider openai-compatible
@@ -127,7 +142,7 @@ gg auth login --token "$OPENAI_API_KEY"
 gg doctor
 ```
 
-Environment-only setup for one-off runs:
+One-off environment override:
 
 ```bash
 export API_TOKEN="$OPENAI_API_KEY"
@@ -138,23 +153,13 @@ gg commit
 
 Notes:
 
-- `API_TOKEN` from the environment overrides the keychain
-- the built-in default provider is `gemini`, so set `provider`, `BASE_API_URL`, and `BASE_MODEL` together when switching providers
-- `gg config show` prints the effective values and where each one came from
+- the default provider is `gemini`
+- when switching providers, set `provider`, `BASE_API_URL`, and `BASE_MODEL` together
+- environment `API_TOKEN` overrides the keychain
 
-### Ollama API Setup
+### Ollama
 
-`gitgud` can talk to Ollama through its OpenAI-compatible API.
-
-Interactive setup:
-
-1. Run `gg config`
-2. Set provider to `openai-compatible`
-3. Set `BASE_API_URL` to `http://localhost:11434/v1`
-4. Set `BASE_MODEL` to an installed Ollama model such as `llama3.1:8b` or `qwen2.5-coder:7b`
-5. Enter any non-empty token value when prompted for `API_TOKEN`
-
-Direct CLI setup:
+Ollama works through its OpenAI-compatible API:
 
 ```bash
 gg config set provider openai-compatible
@@ -164,7 +169,7 @@ gg auth login --token ollama
 gg doctor
 ```
 
-Environment-only setup:
+Or with environment variables:
 
 ```bash
 export API_TOKEN="ollama"
@@ -175,13 +180,19 @@ gg explain
 
 Notes:
 
-- `gitgud` requires `API_TOKEN` to be non-empty even for local providers; Ollama commonly works with a placeholder such as `ollama`
-- model loading in `gg config` uses the provider's `/models` endpoint, so keep Ollama running before opening the model picker
-- if Ollama is bound to a different host or port, use that full `/v1` base URL instead
+- `API_TOKEN` must be non-empty, even for local providers
+- keep Ollama running if you want the model picker to load `/models`
+- if Ollama uses a different host or port, use that full `/v1` base URL
 
-### Conventional Commit Presets
+## Commit Modes
 
-`conventional` mode supports this built-in default preset:
+- `auto`: use the configured AI provider and fall back to heuristic suggestions on timeout
+- `ai-only`: require the AI provider and surface provider errors
+- `heuristic-only`: skip the AI provider and generate local suggestions only
+
+## Conventional Commits
+
+Built-in default types:
 
 - `feat`
 - `fix`
@@ -193,15 +204,7 @@ Notes:
 - `build`
 - `ci`
 
-You can also define custom team presets in the config file and select one with:
-
-```bash
-gg config set conventional-preset team
-gg config set generation-mode heuristic-only
-gg config unset conventional-preset
-```
-
-Example config:
+Custom preset example:
 
 ```toml
 commit_style = "conventional"
@@ -214,167 +217,35 @@ preset = "team"
 types = ["feature", "bugfix", "maintenance"]
 ```
 
-## Command Behavior
-
-### `gg`
-
-Opens the home TUI and shows:
-
-- current branch
-- staged file count
-- unstaged file count
-- remote and upstream status
-
-Keys:
-
-- `c` commit staged changes
-- `p` push current branch
-- `q` quit
-
-### `gg ask`
-
-Describe what you want to do in plain English and get suggested Git command(s) with risk ratings, an explanation, and an alternative approach.
+Select or clear a preset:
 
 ```bash
-gg ask "undo last commit but keep changes"
-gg ask "squash the last 3 commits into one"
-gg ask "how do I move a file to another branch"
-gg ask how do I see what changed in the last commit
+gg config set conventional-preset team
+gg config unset conventional-preset
 ```
 
-Multi-word queries work with or without quotes. `gg` also accepts bare natural language when the first word is not a known Git subcommand:
+## Behavior Notes
 
-```bash
-gg "unstage package.json"
-gg undo my last commit
-```
+- `gg commit` and `gg explain` only use staged changes
+- `gg commit` warns about risky staged diffs, supports inline editing, and can propose split commits for mixed concerns
+- `gg ask` returns recommended and alternative commands with risk badges and explanations
+- dangerous actions suggested by `gg ask` require extra confirmation before execution
+- `gg push` warns about risky outgoing diffs and does not guess across ambiguous remotes
+- `gitgud` shells out to the system `git`, so hooks, credentials, and normal Git config still apply
+- detached HEAD is rejected for commit and push flows
 
-The TUI screen shows:
-- **Recommended** command(s) with a color-coded risk badge: `[SAFE]` (green), `[MED ]` (yellow), `[RISK]` (red)
-- **Alternative** approach (if any) with its own badge
-- **Explanation** of why the recommended approach works
-- **Teaching note** explaining the underlying Git concept
+## Development
 
-Risk levels:
-- **Safe** — read-only or non-destructive: `status`, `log`, `diff`, `fetch`, `add`, `push` (normal)
-- **Medium** — reversible but consequential: `reset` (soft/mixed), `stash`, `merge`, `rebase` (non-main), `commit --amend`, `push --force-with-lease`
-- **Dangerous** — hard to undo: `reset --hard`, `push --force`/`-f`, `clean -f`, `branch -D`, `checkout .`, `restore .`, `rebase main`
-
-Dangerous commands require an extra confirmation dialog before executing.
-
-Keys:
-
-- `Enter` run recommended command(s)
-- `2` run alternative command(s) (when available)
-- `Esc`/`q` cancel
-
-### Other Git Commands
-
-Unknown commands that match a known Git subcommand are passed straight through to Git:
-
-```bash
-gg status
-gg diff --cached
-gg log --oneline -10
-gg branch
-```
-
-To force raw Git for a built-in name that `gg` already uses, call `git` explicitly:
-
-```bash
-gg git commit --amend
-gg git push --force-with-lease
-```
-
-### `gg commit`
-
-- requires staged changes
-- reads the staged diff
-- warns before generation when the staged diff looks unsafe, including `.env` secrets, private keys, huge generated files, minified blobs, lockfile-only changes, and console.log spam
-- uses the configured generation mode:
-  - `auto`: asks the configured AI provider for 1-3 commit message options and falls back to heuristic options on timeout
-  - `ai-only`: asks the configured AI provider and surfaces provider errors instead of falling back
-  - `heuristic-only`: skips the AI provider and generates local heuristic options only
-- shortens overlong AI-generated subjects to fit the 72-character subject limit
-- shows when the staged diff looks like multiple concerns and offers a file-based split commit plan in the TUI
-- lets you choose one option in the TUI
-- supports inline editing before commit
-- respects the configured commit style, including Conventional Commits presets
-- commits only after confirmation
-- can create the proposed split commits after explicit approval with `s`
-
-Keys:
-
-- `Up`/`Down` choose an option
-- `r` regenerate
-- `e` enter edit mode
-- `s` approve the proposed split plan and create separate commits
-- `Enter` confirm commit
-- `Esc` cancel
-- `Ctrl-S` leave edit mode
-
-### `gg explain`
-
-- requires staged changes
-- reads the staged diff
-- asks the configured AI provider to explain the change in four sections
-- prints:
-  - what changed
-  - possible intent
-  - risk areas
-  - test suggestions
-
-### `gg push`
-
-- detects the current branch
-- checks whether an upstream already exists
-- warns before pushing when the outgoing diff looks unsafe, using the same secret, generated-file, minified-blob, lockfile-only, and console.log checks
-- pushes immediately when the target is unambiguous
-- offers `--force-with-lease` only after explicit confirmation if the normal push is rejected
-- errors when the first push target is ambiguous instead of guessing across multiple remotes
-
-### `gg config`
-
-- opens a setup screen by default
-- configures:
-  - provider: `gemini` or `openai-compatible`
-  - `BASE_API_URL`
-  - `API_TOKEN`
-  - `BASE_MODEL`
-    Load available model options with `Enter`, navigate them with `Up`/`Down`, and apply one with `Enter` after `BASE_API_URL` and `API_TOKEN` are filled, or press `e` to type a custom model manually
-  - commit style preference
-  - commit generation mode: `auto`, `ai-only`, or `heuristic-only`
-  - active Conventional Commit preset selection
-- stores non-secret settings in the config file
-- stores `API_TOKEN` in the system keychain
-- preserves custom Conventional Commit preset definitions already stored in the config file
-
-### `gg doctor`
-
-Checks:
-
-- `git` availability
-- whether the current directory is a Git repository
-- AI token availability when AI-backed features are configured
-- provider, config, and override resolution
-- reachability of `BASE_API_URL`
-
-## Notes
-
-- Only staged changes are used to generate the commit message.
-- `gitgud` shells out to the system `git` binary, so hooks, credentials, and your normal Git config still apply.
-- Detached HEAD is rejected for commit and push flows.
-
-## Testing
+Run checks:
 
 ```bash
 cargo fmt
 cargo test
 ```
 
-## Open Source
+Project docs:
 
-- Contributor note: keep `README.md` updated in the same change as any user-visible behavior or workflow change, and add or update tests for behavior changes where appropriate. Agent contributor guidance for Codex, Claude Code, and similar tools lives in `AGENTS.md`.
-- License: MIT, see `LICENSE`
-- Contributions: see `CONTRIBUTING.md`
-- Community expectations: see `CODE_OF_CONDUCT.md`
+- Contributor guidance: `AGENTS.md`
+- Contributing: `CONTRIBUTING.md`
+- Code of conduct: `CODE_OF_CONDUCT.md`
+- License: `LICENSE`
