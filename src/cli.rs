@@ -39,6 +39,11 @@ pub enum Command {
     },
     /// Validate git and AI provider configuration
     Doctor,
+    /// Ask a question in natural language and get suggested git commands
+    Ask {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        query: Vec<String>,
+    },
     #[command(external_subcommand)]
     Passthrough(Vec<OsString>),
 }

@@ -16,10 +16,12 @@
 - Support standard and Conventional Commits styles, including configurable presets
 - Push the current branch to its upstream automatically
 - Offer `--force-with-lease` only after explicit confirmation
+- **Ask questions in natural language** — describe what you want to do and get exact Git command(s) with risk ratings, explanations, and alternatives
 - Configure provider, endpoint, model, token, and commit style in one setup screen
 - Load provider model options in setup after entering a base URL and API token
 - Use Gemini by default, or any OpenAI-compatible provider
 - Pass through normal Git commands like `status`, `log`, `diff`, and `branch`
+- Route bare natural language input (unrecognized as a Git subcommand) automatically to `ask`
 - Validate local setup with a `doctor` command
 
 ## Requirements
@@ -60,6 +62,7 @@ Supported environment overrides:
 - `API_TOKEN`
 - `BASE_API_URL`
 - `BASE_MODEL`
+- `AI_TIMEOUT_SECS` — override the AI request timeout (default: 60 seconds); useful for slow or remote providers
 
 ### Conventional Commit Presets
 
@@ -111,6 +114,9 @@ cargo run --bin gg -- doctor
 cargo run --bin gg -- commit
 cargo run --bin gg -- explain
 cargo run --bin gg -- push
+cargo run --bin gg -- ask "undo last commit but keep changes"
+cargo run --bin gg -- ask "how do I squash the last 3 commits"
+cargo run --bin gg -- "unstage package.json"
 cargo run --bin gg -- status --short
 cargo run --bin gg -- log --oneline -5
 cargo run --bin gg -- git commit --amend
@@ -124,6 +130,7 @@ cargo build --release
 ./target/release/gg commit
 ./target/release/gg explain
 ./target/release/gg push
+./target/release/gg ask "undo last commit but keep changes"
 ```
 
 ## Install
@@ -164,9 +171,46 @@ Keys:
 - `p` push current branch
 - `q` quit
 
+### `gg ask`
+
+Describe what you want to do in plain English and get suggested Git command(s) with risk ratings, an explanation, and an alternative approach.
+
+```bash
+gg ask "undo last commit but keep changes"
+gg ask "squash the last 3 commits into one"
+gg ask "how do I move a file to another branch"
+gg ask how do I see what changed in the last commit
+```
+
+Multi-word queries work with or without quotes. `gg` also accepts bare natural language when the first word is not a known Git subcommand:
+
+```bash
+gg "unstage package.json"
+gg undo my last commit
+```
+
+The TUI screen shows:
+- **Recommended** command(s) with a color-coded risk badge: `[SAFE]` (green), `[MED ]` (yellow), `[RISK]` (red)
+- **Alternative** approach (if any) with its own badge
+- **Explanation** of why the recommended approach works
+- **Teaching note** explaining the underlying Git concept
+
+Risk levels:
+- **Safe** — read-only or non-destructive: `status`, `log`, `diff`, `fetch`, `add`, `push` (normal)
+- **Medium** — reversible but consequential: `reset` (soft/mixed), `stash`, `merge`, `rebase` (non-main), `commit --amend`, `push --force-with-lease`
+- **Dangerous** — hard to undo: `reset --hard`, `push --force`/`-f`, `clean -f`, `branch -D`, `checkout .`, `restore .`, `rebase main`
+
+Dangerous commands require an extra confirmation dialog before executing.
+
+Keys:
+
+- `Enter` run recommended command(s)
+- `2` run alternative command(s) (when available)
+- `Esc`/`q` cancel
+
 ### Other Git Commands
 
-Unknown commands are passed straight through to Git:
+Unknown commands that match a known Git subcommand are passed straight through to Git:
 
 ```bash
 gg status

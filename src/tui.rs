@@ -23,12 +23,13 @@ use tui_textarea::{Input, Key, TextArea};
 
 use crate::{
     ai::{
-        AiClient, CommitSuggestions, PromptInput, SplitCommitPlan,
+        AiClient, AskSuggestion, CommitSuggestions, PromptInput, SplitCommitPlan,
         build_heuristic_commit_suggestions, fetch_model_options, normalize_base_api_url,
         validate_commit_message_with_preset,
     },
     config::{CommitStyle, GenerationMode, Provider, ResolvedConventionalPreset, TokenStatus},
     git::{GitRepo, PushPlan, RepoStatus, UnsafeDiffWarning},
+    risk::{self, RiskLevel},
 };
 
 type Backend = CrosstermBackend<Stdout>;
@@ -50,6 +51,12 @@ pub enum CommitAction {
 pub enum CommitGenerator {
     Ai(AiClient),
     HeuristicOnly,
+}
+
+pub enum AskAction {
+    RunRecommended,
+    RunAlternative,
+    Cancel,
 }
 
 #[derive(Debug, Clone)]
@@ -166,6 +173,221 @@ pub fn show_message(title: &str, message: &str) -> Result<()> {
             }
         }
     })
+}
+
+pub fn run_ask(suggestion: &AskSuggestion, risk_levels: &[RiskLevel]) -> Result<AskAction> {
+    with_terminal(|terminal| ask_loop(terminal, suggestion, risk_levels))
+}
+
+pub fn confirm_dangerous_command(command: &str, description: &str) -> Result<bool> {
+    with_terminal(|terminal| dangerous_command_loop(terminal, command, description))
+}
+
+fn ask_loop(
+    terminal: &mut AppTerminal,
+    suggestion: &AskSuggestion,
+    risk_levels: &[RiskLevel],
+) -> Result<AskAction> {
+    let has_alt = suggestion.alternative.is_some();
+    loop {
+        terminal.draw(|frame| draw_ask(frame, suggestion, risk_levels))?;
+
+        if let Event::Key(key) = event::read()? {
+            match key.code {
+                KeyCode::Enter => return Ok(AskAction::RunRecommended),
+                KeyCode::Char('2') if has_alt => return Ok(AskAction::RunAlternative),
+                KeyCode::Esc | KeyCode::Char('q') => return Ok(AskAction::Cancel),
+                _ => {}
+            }
+        }
+    }
+}
+
+fn dangerous_command_loop(
+    terminal: &mut AppTerminal,
+    command: &str,
+    description: &str,
+) -> Result<bool> {
+    loop {
+        terminal.draw(|frame| draw_dangerous_command_confirm(frame, command, description))?;
+
+        if let Event::Key(key) = event::read()? {
+            match key.code {
+                KeyCode::Enter => return Ok(true),
+                KeyCode::Esc | KeyCode::Char('q') => return Ok(false),
+                _ => {}
+            }
+        }
+    }
+}
+
+fn draw_ask(
+    frame: &mut ratatui::Frame<'_>,
+    suggestion: &AskSuggestion,
+    risk_levels: &[RiskLevel],
+) {
+    let area = frame.area();
+
+    // Build recommended lines
+    let mut rec_lines: Vec<Line<'static>> = Vec::new();
+    for (i, cmd) in suggestion.recommended.iter().enumerate() {
+        let risk = risk_levels.get(i).copied().unwrap_or(RiskLevel::Safe);
+        let (badge_text, badge_color) = risk_badge(risk);
+        rec_lines.push(Line::from(vec![
+            Span::styled(
+                badge_text,
+                Style::default()
+                    .fg(badge_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(" {}", cmd.command)),
+        ]));
+        rec_lines.push(Line::from(vec![
+            Span::raw("       "),
+            Span::styled(
+                cmd.description.clone(),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
+    let rec_height = rec_lines.len() as u16 + 2;
+
+    // Build alternative lines
+    let mut alt_lines: Vec<Line<'static>> = Vec::new();
+    if let Some(alt) = &suggestion.alternative {
+        for cmd in alt {
+            let risk = risk::classify_risk(&cmd.command);
+            let (badge_text, badge_color) = risk_badge(risk);
+            alt_lines.push(Line::from(vec![
+                Span::styled(
+                    badge_text,
+                    Style::default()
+                        .fg(badge_color)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!(" {}", cmd.command)),
+            ]));
+            alt_lines.push(Line::from(vec![
+                Span::raw("       "),
+                Span::styled(
+                    cmd.description.clone(),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+        }
+    }
+
+    let has_alt = !alt_lines.is_empty();
+    let alt_height = if has_alt {
+        alt_lines.len() as u16 + 2
+    } else {
+        0
+    };
+
+    let key_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let mut help_spans: Vec<Span<'static>> = vec![
+        Span::styled("Enter", key_style),
+        Span::raw(" run recommended  "),
+    ];
+    if has_alt {
+        help_spans.push(Span::styled("2", key_style));
+        help_spans.push(Span::raw(" run alternative  "));
+    }
+    help_spans.push(Span::styled("Esc", key_style));
+    help_spans.push(Span::raw("/"));
+    help_spans.push(Span::styled("q", key_style));
+    help_spans.push(Span::raw(" cancel"));
+
+    let explain_lines: Vec<Line<'static>> = vec![
+        Line::from(vec![
+            Span::styled("Explanation: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(suggestion.explanation.clone()),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                "Teaching note: ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(suggestion.teaching_note.clone()),
+        ]),
+    ];
+
+    let constraints: Vec<Constraint> = if has_alt {
+        vec![
+            Constraint::Length(rec_height),
+            Constraint::Length(alt_height),
+            Constraint::Min(6),
+            Constraint::Length(3),
+        ]
+    } else {
+        vec![
+            Constraint::Length(rec_height),
+            Constraint::Min(6),
+            Constraint::Length(3),
+        ]
+    };
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(area);
+
+    let rec_block = Paragraph::new(rec_lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Recommended Commands"),
+        )
+        .wrap(Wrap { trim: false });
+
+    let explain_block = Paragraph::new(explain_lines)
+        .block(Block::default().borders(Borders::ALL).title("Details"))
+        .wrap(Wrap { trim: false });
+
+    let help = Paragraph::new(Line::from(help_spans))
+        .block(Block::default().borders(Borders::ALL).title("Keys"))
+        .alignment(Alignment::Center);
+
+    frame.render_widget(rec_block, layout[0]);
+
+    if has_alt {
+        let alt_block = Paragraph::new(alt_lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Alternative  [2]"),
+            )
+            .wrap(Wrap { trim: false });
+        frame.render_widget(alt_block, layout[1]);
+        frame.render_widget(explain_block, layout[2]);
+        frame.render_widget(help, layout[3]);
+    } else {
+        frame.render_widget(explain_block, layout[1]);
+        frame.render_widget(help, layout[2]);
+    }
+}
+
+fn draw_dangerous_command_confirm(
+    frame: &mut ratatui::Frame<'_>,
+    command: &str,
+    description: &str,
+) {
+    let message = format!(
+        "This command is potentially destructive and cannot be undone:\n\n  {}\n  {}\n\nPress Enter to execute, or Esc to cancel.",
+        command, description
+    );
+    draw_message(frame, "Dangerous Command — Confirm", &message);
+}
+
+fn risk_badge(risk: RiskLevel) -> (&'static str, Color) {
+    match risk {
+        RiskLevel::Safe => ("[SAFE]", Color::Green),
+        RiskLevel::Medium => ("[MED ]", Color::Yellow),
+        RiskLevel::Dangerous => ("[RISK]", Color::Red),
+    }
 }
 
 fn commit_loop(terminal: &mut AppTerminal, state: &mut CommitView) -> Result<CommitAction> {

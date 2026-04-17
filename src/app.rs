@@ -5,7 +5,7 @@ use clap::Parser;
 use rpassword::prompt_password;
 
 use crate::{
-    ai::{AiClient, AiConfig, DiffExplanation, PromptInput},
+    ai::{AiClient, AiConfig, AskContext, DiffExplanation, PromptInput, SuggestedCommand},
     cli::{AuthCommand, Cli, Command, ConfigCommand},
     config::{
         GenerationMode, TokenStatus, config_path, delete_api_token, load_api_token, load_file,
@@ -13,7 +13,8 @@ use crate::{
         store_api_token, token_status, unset_config_value,
     },
     git::{GitRepo, push_needs_force_with_lease},
-    tui::{self, CommitAction, ConfigSetupAction, ConfigSetupInput, HomeAction},
+    risk,
+    tui::{self, AskAction, CommitAction, ConfigSetupAction, ConfigSetupInput, HomeAction},
 };
 
 pub async fn run() -> Result<()> {
@@ -35,7 +36,23 @@ pub async fn run() -> Result<()> {
         Command::Explain => run_explain(&repo).await,
         Command::Push => run_push(&repo),
         Command::Git { args } => run_git_passthrough(&repo, &args),
-        Command::Passthrough(args) => run_git_passthrough(&repo, &args),
+        Command::Ask { query } => run_ask_command(&repo, &query.join(" ")).await,
+        Command::Passthrough(args) => {
+            let first = args
+                .first()
+                .map(|a| a.to_string_lossy().to_ascii_lowercase())
+                .unwrap_or_default();
+            if !first.is_empty() && !is_known_git_subcommand(&first) {
+                let query = args
+                    .iter()
+                    .map(|a| a.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                run_ask_command(&repo, &query).await
+            } else {
+                run_git_passthrough(&repo, &args)
+            }
+        }
         Command::Config { command } => run_config(command),
         Command::Auth { command } => run_auth(command),
         Command::Doctor => run_doctor(&repo).await,
@@ -530,6 +547,157 @@ async fn run_doctor(repo: &GitRepo) -> Result<()> {
 
     println!("doctor checks passed");
     Ok(())
+}
+
+async fn run_ask_command(repo: &GitRepo, query: &str) -> Result<()> {
+    let query = query.trim();
+    if query.is_empty() {
+        println!("Usage: gg ask <natural language query>");
+        println!("Example: gg ask \"undo last commit but keep changes\"");
+        return Ok(());
+    }
+
+    repo.ensure_git_available()?;
+    repo.ensure_repo()?;
+
+    let status = repo.status()?;
+    let branch = status
+        .branch
+        .clone()
+        .unwrap_or_else(|| "DETACHED".to_string());
+    let recent_log = repo.recent_log(5).unwrap_or_default();
+
+    let context = AskContext {
+        branch,
+        staged_count: status.staged_count,
+        unstaged_count: status.unstaged_count,
+        recent_log,
+    };
+
+    let config = AiConfig::load()?;
+    let client = AiClient::new(config)?;
+
+    let suggestion = client.generate_ask_suggestion(query, &context).await?;
+
+    let risk_levels: Vec<_> = suggestion
+        .recommended
+        .iter()
+        .map(|cmd| risk::classify_risk(&cmd.command))
+        .collect();
+
+    let action = tui::run_ask(&suggestion, &risk_levels)?;
+
+    match action {
+        AskAction::RunRecommended => {
+            execute_ask_commands(repo, &suggestion.recommended).await?;
+        }
+        AskAction::RunAlternative => {
+            if let Some(alt) = &suggestion.alternative {
+                execute_ask_commands(repo, alt).await?;
+            } else {
+                println!("No alternative available.");
+            }
+        }
+        AskAction::Cancel => {
+            println!("ask cancelled");
+        }
+    }
+
+    Ok(())
+}
+
+fn is_git_commit_command(cmd: &str) -> bool {
+    let trimmed = cmd.trim();
+    (trimmed == "git commit" || trimmed.starts_with("git commit "))
+        && !trimmed.contains("--amend")
+        && !trimmed.contains("--no-edit")
+}
+
+async fn execute_ask_commands(repo: &GitRepo, commands: &[SuggestedCommand]) -> Result<()> {
+    for (index, cmd) in commands.iter().enumerate() {
+        if is_git_commit_command(&cmd.command) {
+            run_commit(repo).await?;
+            continue;
+        }
+
+        let risk = risk::classify_risk(&cmd.command);
+        if matches!(risk, risk::RiskLevel::Dangerous) {
+            if !tui::confirm_dangerous_command(&cmd.command, &cmd.description)? {
+                println!("cancelled before executing: {}", cmd.command);
+                let remaining = &commands[index..];
+                if !remaining.is_empty() {
+                    println!("commands not executed:");
+                    for r in remaining {
+                        println!("  {}", r.command);
+                    }
+                }
+                return Ok(());
+            }
+        }
+
+        match repo.run_suggested_command(&cmd.command) {
+            Ok(output) => {
+                if !output.trim().is_empty() {
+                    println!("{output}");
+                }
+            }
+            Err(error) => {
+                let remaining = &commands[index + 1..];
+                if !remaining.is_empty() {
+                    eprintln!("Error: {error}");
+                    println!("remaining commands not executed:");
+                    for r in remaining {
+                        println!("  {}", r.command);
+                    }
+                }
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_known_git_subcommand(name: &str) -> bool {
+    matches!(
+        name,
+        "add"
+            | "bisect"
+            | "blame"
+            | "branch"
+            | "checkout"
+            | "cherry-pick"
+            | "clean"
+            | "clone"
+            | "commit"
+            | "config"
+            | "describe"
+            | "diff"
+            | "fetch"
+            | "format-patch"
+            | "grep"
+            | "init"
+            | "log"
+            | "merge"
+            | "mergetool"
+            | "mv"
+            | "notes"
+            | "pull"
+            | "push"
+            | "rebase"
+            | "remote"
+            | "reset"
+            | "restore"
+            | "revert"
+            | "rm"
+            | "shortlog"
+            | "show"
+            | "stash"
+            | "status"
+            | "submodule"
+            | "switch"
+            | "tag"
+            | "worktree"
+    )
 }
 
 #[derive(Debug)]

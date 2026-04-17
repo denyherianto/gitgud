@@ -244,6 +244,26 @@ impl GitRepo {
         Ok(())
     }
 
+    pub fn recent_log(&self, count: usize) -> Result<String> {
+        let limit = format!("-{count}");
+        let args = ["log", "--oneline", limit.as_str()];
+        self.run_checked_slice(&args)
+    }
+
+    pub fn run_suggested_command(&self, command: &str) -> Result<String> {
+        let stripped = command
+            .trim()
+            .strip_prefix("git ")
+            .ok_or_else(|| anyhow!("suggested command must start with 'git ': {}", command))?;
+
+        let args: Vec<&str> = stripped.split_whitespace().collect();
+        if args.is_empty() {
+            bail!("suggested command has no arguments after 'git': {}", command);
+        }
+
+        self.run_checked_slice(&args)
+    }
+
     pub fn run_passthrough(&self, args: &[OsString]) -> Result<ExitStatus> {
         Command::new("git")
             .current_dir(&self.cwd)

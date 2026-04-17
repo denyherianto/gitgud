@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, time::Duration};
+use std::{collections::BTreeMap, env, time::Duration};
 
 use anyhow::{Context, Result, anyhow, bail};
 use reqwest::{Client, Url};
@@ -12,7 +12,7 @@ pub const DEFAULT_PROVIDER: Provider = Provider::Gemini;
 pub const DEFAULT_BASE_API_URL: &str = "https://generativelanguage.googleapis.com/v1beta/openai";
 pub const DEFAULT_BASE_MODEL: &str = "gemini-2.5-flash";
 pub const DEFAULT_COMMIT_STYLE: CommitStyle = CommitStyle::Standard;
-const DEFAULT_TIMEOUT_SECS: u64 = 20;
+const DEFAULT_TIMEOUT_SECS: u64 = 60;
 const DEFAULT_MAX_DIFF_CHARS: usize = 12_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,7 +30,7 @@ pub struct AiConfig {
 impl AiConfig {
     pub fn load() -> Result<Self> {
         let resolved = resolve_ai_settings()?;
-        Self::new(
+        let mut config = Self::new(
             resolved.api_token.value,
             resolved.provider.value,
             &resolved.base_api_url.value,
@@ -38,7 +38,11 @@ impl AiConfig {
             resolved.commit_style.value,
             resolved.generation_mode.value,
             resolved.conventional_preset.value,
-        )
+        )?;
+        if let Some(timeout_secs) = read_timeout_override() {
+            config.timeout = Duration::from_secs(timeout_secs);
+        }
+        Ok(config)
     }
 
     pub fn new(
@@ -105,6 +109,28 @@ pub struct DiffExplanation {
 pub struct SplitCommitPlan {
     pub message: String,
     pub files: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AskSuggestion {
+    pub recommended: Vec<SuggestedCommand>,
+    pub alternative: Option<Vec<SuggestedCommand>>,
+    pub explanation: String,
+    pub teaching_note: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SuggestedCommand {
+    pub command: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct AskContext {
+    pub branch: String,
+    pub staged_count: usize,
+    pub unstaged_count: usize,
+    pub recent_log: String,
 }
 
 #[derive(Debug, Clone)]
@@ -187,6 +213,21 @@ impl AiClient {
             .await?;
 
         parse_diff_explanation(&content)
+    }
+
+    pub async fn generate_ask_suggestion(
+        &self,
+        query: &str,
+        context: &AskContext,
+    ) -> Result<AskSuggestion> {
+        let content = self
+            .request_chat_completion(
+                build_ask_system_prompt(),
+                build_ask_user_prompt(query, context),
+            )
+            .await?;
+
+        parse_ask_suggestion(&content)
     }
 
     async fn generate_commit_suggestions_from_provider(
@@ -307,6 +348,12 @@ pub async fn fetch_model_options(base_api_url: &str, api_token: &str) -> Result<
     }
 
     Ok(models)
+}
+
+fn read_timeout_override() -> Option<u64> {
+    let raw = env::var("AI_TIMEOUT_SECS").ok()?;
+    let secs: u64 = raw.trim().parse().ok()?;
+    if secs == 0 { None } else { Some(secs) }
 }
 
 pub fn normalize_base_api_url(raw: &str) -> Result<String> {
@@ -490,6 +537,79 @@ fn build_system_prompt(
 
 fn build_diff_explanation_system_prompt() -> String {
     "You explain staged Git diffs for engineers. Return valid JSON only with this shape: {\"what_changed\":[\"item 1\"],\"possible_intent\":[\"item 1\"],\"risk_areas\":[\"item 1\"],\"test_suggestions\":[\"item 1\"]}. Each field must be an array of 1 to 4 concise strings. Base `what_changed`, `risk_areas`, and `test_suggestions` on the diff only. `possible_intent` may be an inference from the diff. Do not use markdown fences, headings, numbering, or extra commentary.".to_string()
+}
+
+fn build_ask_system_prompt() -> String {
+    r#"You are a Git command assistant. Given a natural language description, suggest the exact git command(s). Return valid JSON with this shape: {"recommended":[{"command":"git ...","description":"..."}],"alternative":[{"command":"git ...","description":"..."}],"explanation":"...","teaching_note":"..."}. `recommended` is 1-4 commands in execution order. `alternative` is optional — use null if there is no meaningful alternative. Every `command` must start with "git ". `explanation` gives context on the recommended approach. `teaching_note` explains the underlying Git concept. No markdown fences."#.to_string()
+}
+
+fn build_ask_user_prompt(query: &str, context: &AskContext) -> String {
+    let log = if context.recent_log.trim().is_empty() {
+        "(none)".to_string()
+    } else {
+        context.recent_log.clone()
+    };
+    format!(
+        "Query: {}\n\nContext:\nBranch: {}\nStaged files: {}\nUnstaged files: {}\nRecent commits:\n{}",
+        query, context.branch, context.staged_count, context.unstaged_count, log
+    )
+}
+
+fn parse_ask_suggestion(raw: &str) -> Result<AskSuggestion> {
+    let json = raw.trim();
+
+    let parsed: AskSuggestionPayload = if let Ok(p) = serde_json::from_str(json) {
+        p
+    } else if let Some(stripped) = strip_code_fence(json) {
+        serde_json::from_str(stripped).context("failed to parse ask suggestion JSON")?
+    } else {
+        bail!("failed to parse ask suggestion JSON");
+    };
+
+    if parsed.recommended.is_empty() {
+        bail!("AI provider returned no recommended commands");
+    }
+
+    for cmd in &parsed.recommended {
+        if !cmd.command.trim_start().starts_with("git ") {
+            bail!(
+                "AI provider returned a command that does not start with 'git ': {}",
+                cmd.command
+            );
+        }
+    }
+
+    if let Some(alt) = &parsed.alternative {
+        for cmd in alt {
+            if !cmd.command.trim_start().starts_with("git ") {
+                bail!(
+                    "AI provider returned an alternative command that does not start with 'git ': {}",
+                    cmd.command
+                );
+            }
+        }
+    }
+
+    Ok(AskSuggestion {
+        recommended: parsed
+            .recommended
+            .into_iter()
+            .map(|c| SuggestedCommand {
+                command: c.command,
+                description: c.description,
+            })
+            .collect(),
+        alternative: parsed.alternative.map(|alts| {
+            alts.into_iter()
+                .map(|c| SuggestedCommand {
+                    command: c.command,
+                    description: c.description,
+                })
+                .collect()
+        }),
+        explanation: parsed.explanation,
+        teaching_note: parsed.teaching_note,
+    })
 }
 
 #[cfg(test)]
@@ -1424,6 +1544,21 @@ struct DiffExplanationPayload {
 }
 
 #[derive(Debug, Deserialize)]
+struct AskSuggestionPayload {
+    recommended: Vec<SuggestedCommandPayload>,
+    #[serde(default)]
+    alternative: Option<Vec<SuggestedCommandPayload>>,
+    explanation: String,
+    teaching_note: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SuggestedCommandPayload {
+    command: String,
+    description: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct ModelListResponse {
     #[serde(default)]
     data: Vec<ModelPayload>,
@@ -1479,11 +1614,13 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        AiConfig, DEFAULT_BASE_API_URL, DiffExplanation, SplitCommitPlan, build_commit_prompt,
+        AiConfig, AskContext, AskSuggestion, DEFAULT_BASE_API_URL, DiffExplanation,
+        SplitCommitPlan, SuggestedCommand, build_ask_user_prompt, build_commit_prompt,
         build_diff_explanation_prompt, build_heuristic_commit_options,
-        build_heuristic_commit_suggestions, normalize_base_api_url, parse_commit_options,
-        parse_commit_suggestions, parse_commit_suggestions_with_preset, parse_diff_explanation,
-        truncate_diff, validate_commit_message, validate_commit_message_with_preset,
+        build_heuristic_commit_suggestions, normalize_base_api_url, parse_ask_suggestion,
+        parse_commit_options, parse_commit_suggestions, parse_commit_suggestions_with_preset,
+        parse_diff_explanation, truncate_diff, validate_commit_message,
+        validate_commit_message_with_preset,
     };
     use crate::config::{CommitStyle, GenerationMode, Provider, ResolvedConventionalPreset};
 
@@ -1888,5 +2025,59 @@ mod tests {
         });
 
         assert!(suggestions.options[0].starts_with("bugfix(parser): "));
+    }
+
+    #[test]
+    fn parses_ask_suggestion_json() {
+        let raw = r#"{"recommended":[{"command":"git reset --soft HEAD~1","description":"Undo last commit, keep changes staged"}],"alternative":[{"command":"git revert HEAD","description":"Create a revert commit"}],"explanation":"reset --soft moves HEAD back one commit.","teaching_note":"--soft preserves the index."}"#;
+        let suggestion = parse_ask_suggestion(raw).unwrap();
+
+        assert_eq!(
+            suggestion,
+            AskSuggestion {
+                recommended: vec![SuggestedCommand {
+                    command: "git reset --soft HEAD~1".into(),
+                    description: "Undo last commit, keep changes staged".into(),
+                }],
+                alternative: Some(vec![SuggestedCommand {
+                    command: "git revert HEAD".into(),
+                    description: "Create a revert commit".into(),
+                }]),
+                explanation: "reset --soft moves HEAD back one commit.".into(),
+                teaching_note: "--soft preserves the index.".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_ask_suggestion_with_null_alternative() {
+        let raw = r#"{"recommended":[{"command":"git status","description":"Show repo status"}],"alternative":null,"explanation":"Shows staged and unstaged changes.","teaching_note":"Use regularly to orient yourself."}"#;
+        let suggestion = parse_ask_suggestion(raw).unwrap();
+
+        assert!(suggestion.alternative.is_none());
+    }
+
+    #[test]
+    fn rejects_ask_suggestion_with_non_git_command() {
+        let raw = r#"{"recommended":[{"command":"rm -rf .git","description":"Delete git repo"}],"alternative":null,"explanation":"...","teaching_note":"..."}"#;
+        let error = parse_ask_suggestion(raw).unwrap_err();
+
+        assert!(error.to_string().contains("does not start with 'git '"));
+    }
+
+    #[test]
+    fn builds_ask_user_prompt_with_context() {
+        let context = AskContext {
+            branch: "main".into(),
+            staged_count: 2,
+            unstaged_count: 1,
+            recent_log: "abc1234 feat: add login\ndef5678 fix: auth bug".into(),
+        };
+        let prompt = build_ask_user_prompt("undo last commit", &context);
+
+        assert!(prompt.contains("undo last commit"));
+        assert!(prompt.contains("Branch: main"));
+        assert!(prompt.contains("Staged files: 2"));
+        assert!(prompt.contains("abc1234 feat: add login"));
     }
 }
