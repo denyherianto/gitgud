@@ -214,40 +214,6 @@ preset = "team"
 types = ["feature", "bugfix", "maintenance"]
 ```
 
-## Usage
-
-Build or run with Cargo:
-
-```bash
-cargo run --bin gg -- --help
-cargo run --bin gg -- config
-cargo run --bin gg -- config show
-cargo run --bin gg -- config set conventional-preset team
-cargo run --bin gg -- config set generation-mode ai-only
-cargo run --bin gg -- auth status
-cargo run --bin gg -- doctor
-cargo run --bin gg -- commit
-cargo run --bin gg -- explain
-cargo run --bin gg -- push
-cargo run --bin gg -- ask "undo last commit but keep changes"
-cargo run --bin gg -- ask "how do I squash the last 3 commits"
-cargo run --bin gg -- "unstage package.json"
-cargo run --bin gg -- status --short
-cargo run --bin gg -- log --oneline -5
-cargo run --bin gg -- git commit --amend
-```
-
-After building:
-
-```bash
-cargo build --release
-./target/release/gg
-./target/release/gg commit
-./target/release/gg explain
-./target/release/gg push
-./target/release/gg ask "undo last commit but keep changes"
-```
-
 ## Command Behavior
 
 ### `gg`
