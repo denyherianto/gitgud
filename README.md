@@ -107,6 +107,78 @@ Supported environment overrides:
 - `BASE_MODEL`
 - `AI_TIMEOUT_SECS` — override the AI request timeout (default: 60 seconds); useful for slow or remote providers
 
+### BYOK Quick Start
+
+Bring your own key by pointing `gitgud` at the provider you want and storing that provider's API token.
+
+Interactive setup:
+
+```bash
+gg config
+```
+
+Direct CLI setup for an OpenAI-compatible provider:
+
+```bash
+gg config set provider openai-compatible
+gg config set base-api-url https://api.openai.com/v1
+gg config set base-model gpt-4.1-mini
+gg auth login --token "$OPENAI_API_KEY"
+gg doctor
+```
+
+Environment-only setup for one-off runs:
+
+```bash
+export API_TOKEN="$OPENAI_API_KEY"
+export BASE_API_URL="https://api.openai.com/v1"
+export BASE_MODEL="gpt-4.1-mini"
+gg commit
+```
+
+Notes:
+
+- `API_TOKEN` from the environment overrides the keychain
+- the built-in default provider is `gemini`, so set `provider`, `BASE_API_URL`, and `BASE_MODEL` together when switching providers
+- `gg config show` prints the effective values and where each one came from
+
+### Ollama API Setup
+
+`gitgud` can talk to Ollama through its OpenAI-compatible API.
+
+Interactive setup:
+
+1. Run `gg config`
+2. Set provider to `openai-compatible`
+3. Set `BASE_API_URL` to `http://localhost:11434/v1`
+4. Set `BASE_MODEL` to an installed Ollama model such as `llama3.1:8b` or `qwen2.5-coder:7b`
+5. Enter any non-empty token value when prompted for `API_TOKEN`
+
+Direct CLI setup:
+
+```bash
+gg config set provider openai-compatible
+gg config set base-api-url http://localhost:11434/v1
+gg config set base-model llama3.1:8b
+gg auth login --token ollama
+gg doctor
+```
+
+Environment-only setup:
+
+```bash
+export API_TOKEN="ollama"
+export BASE_API_URL="http://localhost:11434/v1"
+export BASE_MODEL="llama3.1:8b"
+gg explain
+```
+
+Notes:
+
+- `gitgud` requires `API_TOKEN` to be non-empty even for local providers; Ollama commonly works with a placeholder such as `ollama`
+- model loading in `gg config` uses the provider's `/models` endpoint, so keep Ollama running before opening the model picker
+- if Ollama is bound to a different host or port, use that full `/v1` base URL instead
+
 ### Conventional Commit Presets
 
 `conventional` mode supports this built-in default preset:
