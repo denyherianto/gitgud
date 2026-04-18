@@ -29,6 +29,7 @@ use crate::{
     },
     config::{CommitStyle, GenerationMode, Provider, ResolvedConventionalPreset, TokenStatus},
     git::{GitRepo, PushPlan, RepoStatus, UnsafeDiffWarning},
+    rescue::{RescueContext, RescueIncident, RescuePlan},
     risk::{self, RiskLevel},
 };
 
@@ -39,6 +40,7 @@ pub enum HomeAction {
     Ship,
     Commit,
     Push,
+    Rescue,
     Quit,
 }
 
@@ -57,6 +59,12 @@ pub enum CommitGenerator {
 pub enum AskAction {
     RunRecommended,
     RunAlternative,
+    Cancel,
+}
+
+pub enum RescuePlanAction {
+    Recommended,
+    Alternative(usize),
     Cancel,
 }
 
@@ -92,6 +100,7 @@ pub fn run_home(status: &RepoStatus) -> Result<HomeAction> {
                     KeyCode::Char('s') => return Ok(HomeAction::Ship),
                     KeyCode::Char('c') => return Ok(HomeAction::Commit),
                     KeyCode::Char('p') => return Ok(HomeAction::Push),
+                    KeyCode::Char('r') => return Ok(HomeAction::Rescue),
                     KeyCode::Esc | KeyCode::Char('q') => return Ok(HomeAction::Quit),
                     _ => {}
                 }
@@ -193,8 +202,45 @@ pub fn confirm_message(title: &str, message: &str) -> Result<bool> {
     })
 }
 
+pub fn prompt_input(title: &str, prompt: &str, initial: Option<&str>) -> Result<Option<String>> {
+    let mut textarea = TextArea::default();
+    textarea.set_block(Block::default().borders(Borders::ALL).title(title));
+    textarea.set_cursor_line_style(Style::default());
+    textarea.insert_str(initial.unwrap_or(""));
+
+    with_terminal(|terminal| {
+        loop {
+            terminal.draw(|frame| draw_prompt_input(frame, &textarea, title, prompt))?;
+
+            if let Event::Key(key) = event::read()? {
+                match key.code {
+                    KeyCode::Enter if key.modifiers.is_empty() => {
+                        let value = textarea.lines().join("\n").trim().to_string();
+                        return Ok(Some(value));
+                    }
+                    KeyCode::Esc => return Ok(None),
+                    _ => {
+                        textarea.input(key_event_to_textarea_input(key));
+                    }
+                }
+            }
+        }
+    })
+}
+
 pub fn run_ask(suggestion: &AskSuggestion, risk_levels: &[RiskLevel]) -> Result<AskAction> {
     with_terminal(|terminal| ask_loop(terminal, suggestion, risk_levels))
+}
+
+pub fn run_rescue_diagnosis(
+    context: &RescueContext,
+    suggested: RescueIncident,
+) -> Result<Option<RescueIncident>> {
+    with_terminal(|terminal| rescue_diagnosis_loop(terminal, context, suggested))
+}
+
+pub fn run_rescue_plan(plan: &RescuePlan) -> Result<RescuePlanAction> {
+    with_terminal(|terminal| rescue_plan_loop(terminal, plan))
 }
 
 pub fn confirm_dangerous_command(command: &str, description: &str) -> Result<bool> {
@@ -233,6 +279,64 @@ fn dangerous_command_loop(
             match key.code {
                 KeyCode::Enter => return Ok(true),
                 KeyCode::Esc | KeyCode::Char('q') => return Ok(false),
+                _ => {}
+            }
+        }
+    }
+}
+
+fn rescue_diagnosis_loop(
+    terminal: &mut AppTerminal,
+    context: &RescueContext,
+    suggested: RescueIncident,
+) -> Result<Option<RescueIncident>> {
+    let incidents = RescueIncident::all();
+    let mut selected = incidents
+        .iter()
+        .position(|incident| *incident == suggested)
+        .unwrap_or(0);
+
+    loop {
+        terminal.draw(|frame| draw_rescue_diagnosis(frame, context, selected))?;
+
+        if let Event::Key(key) = event::read()? {
+            match key.code {
+                KeyCode::Up => {
+                    selected = selected.saturating_sub(1);
+                }
+                KeyCode::Down => {
+                    selected = (selected + 1).min(incidents.len().saturating_sub(1));
+                }
+                KeyCode::Enter => return Ok(Some(incidents[selected])),
+                KeyCode::Esc | KeyCode::Char('q') => return Ok(None),
+                _ => {}
+            }
+        }
+    }
+}
+
+fn rescue_plan_loop(terminal: &mut AppTerminal, plan: &RescuePlan) -> Result<RescuePlanAction> {
+    let option_count = 1 + plan.alternatives.len();
+    let mut selected = 0usize;
+
+    loop {
+        terminal.draw(|frame| draw_rescue_plan(frame, plan, selected))?;
+
+        if let Event::Key(key) = event::read()? {
+            match key.code {
+                KeyCode::Up => {
+                    selected = selected.saturating_sub(1);
+                }
+                KeyCode::Down => {
+                    selected = (selected + 1).min(option_count.saturating_sub(1));
+                }
+                KeyCode::Enter => {
+                    if selected == 0 {
+                        return Ok(RescuePlanAction::Recommended);
+                    }
+                    return Ok(RescuePlanAction::Alternative(selected - 1));
+                }
+                KeyCode::Esc | KeyCode::Char('q') => return Ok(RescuePlanAction::Cancel),
                 _ => {}
             }
         }
@@ -385,6 +489,230 @@ fn draw_ask(frame: &mut ratatui::Frame<'_>, suggestion: &AskSuggestion, risk_lev
         frame.render_widget(explain_block, layout[1]);
         frame.render_widget(help, layout[2]);
     }
+}
+
+fn draw_rescue_diagnosis(frame: &mut ratatui::Frame<'_>, context: &RescueContext, selected: usize) {
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(7),
+            Constraint::Min(10),
+            Constraint::Length(3),
+        ])
+        .split(frame.area());
+    let content = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
+        .split(layout[1]);
+
+    let summary = Paragraph::new(vec![
+        Line::from(format!(
+            "Branch: {}",
+            context.branch.as_deref().unwrap_or("DETACHED")
+        )),
+        Line::from(format!("HEAD: {}", context.head_sha)),
+        Line::from(format!(
+            "Upstream: {}",
+            context.upstream.as_deref().unwrap_or("(none)")
+        )),
+        Line::from(format!(
+            "Stash candidates: live {} / dropped {}",
+            context.stash_entries.len(),
+            context.lost_stash_candidates.len()
+        )),
+        Line::from(format!(
+            "Rebase in progress: {}",
+            if context.has_rebase_in_progress {
+                "yes"
+            } else {
+                "no"
+            }
+        )),
+    ])
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Rescue Diagnosis"),
+    )
+    .wrap(Wrap { trim: false });
+
+    let mut items = Vec::new();
+    for entry in &context.incident_matches {
+        items.push(ListItem::new(format!(
+            "{}  [{}]",
+            entry.incident.title(),
+            entry.score
+        )));
+    }
+
+    let incidents = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Incident Picker"),
+        )
+        .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan))
+        .highlight_symbol("> ");
+    let mut state = ListState::default();
+    state.select(Some(selected));
+
+    let detail = context
+        .incident_matches
+        .get(selected)
+        .map(|entry| {
+            let mut lines = vec![Line::from(entry.summary.clone()), Line::from("")];
+            for evidence in &entry.evidence {
+                lines.push(Line::from(format!("- {evidence}")));
+            }
+            lines
+        })
+        .unwrap_or_else(|| vec![Line::from("(no details)")]);
+    let detail = Paragraph::new(detail)
+        .block(Block::default().borders(Borders::ALL).title("Evidence"))
+        .wrap(Wrap { trim: false });
+
+    let help = Paragraph::new("Up/Down choose incident  Enter open recovery plan  Esc cancel")
+        .block(Block::default().borders(Borders::ALL).title("Keys"))
+        .alignment(Alignment::Center);
+
+    frame.render_widget(summary, layout[0]);
+    frame.render_stateful_widget(incidents, content[0], &mut state);
+    frame.render_widget(detail, content[1]);
+    frame.render_widget(help, layout[2]);
+}
+
+fn draw_rescue_plan(frame: &mut ratatui::Frame<'_>, plan: &RescuePlan, selected: usize) {
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(7),
+            Constraint::Min(12),
+            Constraint::Length(3),
+        ])
+        .split(frame.area());
+    let content = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .split(layout[1]);
+
+    let mut header_lines = vec![Line::from(plan.summary.clone())];
+    for finding in &plan.findings {
+        header_lines.push(Line::from(format!("- {finding}")));
+    }
+    if let Some(note) = &plan.note {
+        header_lines.push(Line::from(""));
+        header_lines.push(Line::from(vec![Span::styled(
+            note.clone(),
+            Style::default().fg(Color::Yellow),
+        )]));
+    }
+
+    let header = Paragraph::new(header_lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(plan.title.clone()),
+        )
+        .wrap(Wrap { trim: false });
+
+    let mut options = vec![ListItem::new(format!(
+        "Recommended: {}",
+        plan.recommended.title
+    ))];
+    for alternative in &plan.alternatives {
+        options.push(ListItem::new(format!("Alternative: {}", alternative.title)));
+    }
+    let option_list = List::new(options)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Recovery Paths"),
+        )
+        .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan))
+        .highlight_symbol("> ");
+    let mut state = ListState::default();
+    state.select(Some(selected));
+
+    let option = if selected == 0 {
+        &plan.recommended
+    } else {
+        plan.alternatives
+            .get(selected - 1)
+            .unwrap_or(&plan.recommended)
+    };
+    let mut preview_lines = vec![
+        Line::from(vec![
+            Span::styled("Summary: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(option.summary.clone()),
+        ]),
+        Line::from(vec![
+            Span::styled("Impact: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(option.impact.clone()),
+        ]),
+        Line::from(vec![
+            Span::styled("Rollback: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(option.rollback_hint.clone()),
+        ]),
+        Line::from(""),
+    ];
+    if option.steps.is_empty() {
+        preview_lines.push(Line::from("(no executable steps)"));
+    } else {
+        for step in &option.steps {
+            preview_lines.push(Line::from(format!("- {}", step.description)));
+            preview_lines.push(Line::from(format!("  {}", step.command_preview)));
+        }
+    }
+    if option.requires_fetch {
+        preview_lines.push(Line::from(""));
+        preview_lines.push(Line::from(vec![Span::styled(
+            "This path may fetch remote refs before it restores anything.",
+            Style::default().fg(Color::Yellow),
+        )]));
+    }
+
+    let preview = Paragraph::new(preview_lines)
+        .block(Block::default().borders(Borders::ALL).title("Preview"))
+        .wrap(Wrap { trim: false });
+    let help = Paragraph::new("Up/Down choose path  Enter run selected path  Esc cancel")
+        .block(Block::default().borders(Borders::ALL).title("Keys"))
+        .alignment(Alignment::Center);
+
+    frame.render_widget(header, layout[0]);
+    frame.render_stateful_widget(option_list, content[0], &mut state);
+    frame.render_widget(preview, content[1]);
+    frame.render_widget(help, layout[2]);
+}
+
+fn draw_prompt_input(
+    frame: &mut ratatui::Frame<'_>,
+    textarea: &TextArea<'_>,
+    title: &str,
+    prompt: &str,
+) {
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(5),
+            Constraint::Length(5),
+            Constraint::Length(3),
+        ])
+        .split(centered_rect(80, 40, frame.area()));
+    frame.render_widget(Clear, centered_rect(80, 40, frame.area()));
+
+    let prompt_block = Paragraph::new(prompt)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .wrap(Wrap { trim: false });
+    let help = Paragraph::new("Type a SHA or ref  Enter submit  Esc cancel")
+        .block(Block::default().borders(Borders::ALL).title("Keys"))
+        .alignment(Alignment::Center);
+
+    frame.render_widget(prompt_block, layout[0]);
+    frame.render_widget(textarea, layout[1]);
+    frame.render_widget(help, layout[2]);
+
+    let (x, y) = textarea.cursor();
+    frame.set_cursor_position((layout[1].x + x as u16 + 1, layout[1].y + y as u16 + 1));
 }
 
 fn draw_dangerous_command_confirm(
@@ -733,6 +1061,7 @@ fn draw_home(frame: &mut ratatui::Frame<'_>, status: &RepoStatus) {
         Line::from("s  ship branch"),
         Line::from("c  commit staged changes"),
         Line::from("p  push current branch"),
+        Line::from("r  rescue Git mistakes"),
         Line::from("q  quit"),
     ])
     .block(Block::default().borders(Borders::ALL).title("Actions"))

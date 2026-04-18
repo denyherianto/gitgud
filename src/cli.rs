@@ -3,6 +3,7 @@ use std::ffi::OsString;
 use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::config::{CommitStyle, Provider};
+use crate::rescue::RescueIncident;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -24,6 +25,11 @@ pub enum Command {
     Explain,
     /// Push the current branch automatically and confirm force-with-lease only when needed
     Push,
+    /// Diagnose and recover common Git mistakes with guided rescue flows
+    Rescue {
+        #[arg(value_enum)]
+        incident: Option<RescueIncident>,
+    },
     /// Run a raw git command, including built-in names like `commit` or `push`
     Git {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -165,6 +171,18 @@ mod tests {
 
         match cli.command {
             Some(Command::Ship) => {}
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_rescue_command() {
+        let cli = Cli::try_parse_from(["gg", "rescue", "detached-head"]).unwrap();
+
+        match cli.command {
+            Some(Command::Rescue { incident }) => {
+                assert!(incident.is_some());
+            }
             other => panic!("unexpected command: {other:?}"),
         }
     }

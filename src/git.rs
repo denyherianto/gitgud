@@ -49,6 +49,20 @@ pub struct ShipRange {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReflogEntry {
+    pub selector: String,
+    pub commit: String,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StashEntry {
+    pub reference: String,
+    pub commit: String,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PushPlan {
     Upstream { branch: String },
     SetUpstream { remote: String, branch: String },
@@ -295,6 +309,163 @@ impl GitRepo {
         self.run_checked_slice(&args)
     }
 
+    pub fn head_sha(&self) -> Result<String> {
+        self.run_checked(["rev-parse", "HEAD"])
+            .map(|output| output.trim().to_string())
+    }
+
+    pub fn git_dir(&self) -> Result<PathBuf> {
+        self.run_checked(["rev-parse", "--git-dir"]).map(|output| {
+            let path = output.trim();
+            if Path::new(path).is_absolute() {
+                PathBuf::from(path)
+            } else {
+                self.cwd.join(path)
+            }
+        })
+    }
+
+    pub fn rebase_in_progress(&self) -> Result<bool> {
+        let git_dir = self.git_dir()?;
+        Ok(git_dir.join("rebase-apply").exists() || git_dir.join("rebase-merge").exists())
+    }
+
+    pub fn local_branches(&self) -> Result<Vec<String>> {
+        let output =
+            self.run_checked(["for-each-ref", "--format=%(refname:short)", "refs/heads"])?;
+        Ok(output
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect())
+    }
+
+    pub fn remote_branches(&self) -> Result<Vec<String>> {
+        let output =
+            self.run_checked(["for-each-ref", "--format=%(refname:short)", "refs/remotes"])?;
+        Ok(output
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .filter(|line| !line.ends_with("/HEAD"))
+            .map(str::to_string)
+            .collect())
+    }
+
+    pub fn reflog(&self, reference: &str, count: usize) -> Result<Vec<ReflogEntry>> {
+        let limit = format!("-{count}");
+        let args = [
+            "log",
+            "-g",
+            "--format=%gD%x1f%H%x1f%gs%x1e",
+            limit.as_str(),
+            reference,
+        ];
+        let output = self.run_checked_slice(&args)?;
+        Ok(parse_reflog_entries(&output))
+    }
+
+    pub fn stash_entries(&self) -> Result<Vec<StashEntry>> {
+        let output = self.run_checked(["stash", "list", "--format=%gd%x1f%H%x1f%gs%x1e"])?;
+        Ok(parse_stash_entries(&output))
+    }
+
+    pub fn dropped_stash_candidates(&self) -> Result<Vec<StashEntry>> {
+        let output =
+            self.run_checked(["fsck", "--no-reflogs", "--unreachable", "--no-progress"])?;
+        let mut candidates = Vec::new();
+
+        for sha in output.lines().filter_map(parse_unreachable_commit_sha) {
+            let subject = self
+                .run_checked(["show", "-s", "--format=%s", sha.as_str()])?
+                .trim()
+                .to_string();
+            if subject.starts_with("WIP on ") || subject.starts_with("On ") {
+                candidates.push(StashEntry {
+                    reference: sha.clone(),
+                    commit: sha,
+                    summary: subject,
+                });
+            }
+        }
+
+        Ok(candidates)
+    }
+
+    pub fn resolve_ref(&self, reference: &str) -> Result<String> {
+        self.run_checked(["rev-parse", "--verify", reference])
+            .map(|output| output.trim().to_string())
+    }
+
+    pub fn merge_base_commit(&self, left: &str, right: &str) -> Result<String> {
+        self.merge_base(left, right)
+    }
+
+    pub fn commits_between(&self, base: &str, head: &str) -> Result<Vec<BranchCommit>> {
+        let range = format!("{base}..{head}");
+        let output = self.run_checked_slice(&[
+            "log",
+            "--reverse",
+            "--format=%H%x1f%s%x1f%b%x1e",
+            range.as_str(),
+        ])?;
+        Ok(parse_branch_commits(&output))
+    }
+
+    pub fn upstream_branch(&self) -> Result<Option<String>> {
+        match self.run_checked(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]) {
+            Ok(output) => Ok(Some(output.trim().to_string())),
+            Err(_) => Ok(None),
+        }
+    }
+
+    pub fn create_snapshot_ref(&self, reference: &str, target: &str) -> Result<String> {
+        self.run_checked_slice(&["update-ref", reference, target])
+    }
+
+    pub fn create_branch_at(&self, branch: &str, target: &str) -> Result<String> {
+        self.run_checked_slice(&["branch", branch, target])
+    }
+
+    pub fn create_and_checkout_branch(&self, branch: &str, target: &str) -> Result<String> {
+        self.run_checked_slice(&["checkout", "-b", branch, target])
+    }
+
+    pub fn checkout_branch(&self, branch: &str) -> Result<String> {
+        self.run_checked(["checkout", branch])
+    }
+
+    pub fn set_branch_ref(&self, branch: &str, target: &str) -> Result<String> {
+        let reference = format!("refs/heads/{branch}");
+        self.run_checked_slice(&["update-ref", reference.as_str(), target])
+    }
+
+    pub fn reset_hard(&self, target: &str) -> Result<String> {
+        self.run_checked(["reset", "--hard", target])
+    }
+
+    pub fn rebase_abort(&self) -> Result<String> {
+        self.run_checked(["rebase", "--abort"])
+    }
+
+    pub fn stash_branch(&self, branch: &str, stash_ref: &str) -> Result<String> {
+        self.run_checked_slice(&["stash", "branch", branch, stash_ref])
+    }
+
+    pub fn stash_apply(&self, stash_ref: &str) -> Result<String> {
+        self.run_checked(["stash", "apply", stash_ref])
+    }
+
+    pub fn fetch_remote_branch(&self, remote: &str, branch: &str) -> Result<String> {
+        self.run_checked(["fetch", remote, branch])
+    }
+
+    pub fn force_push_ref(&self, remote: &str, source: &str, branch: &str) -> Result<String> {
+        let spec = format!("{source}:refs/heads/{branch}");
+        self.run_checked_slice(&["push", "--force-with-lease", remote, spec.as_str()])
+    }
+
     pub fn run_suggested_command(&self, command: &str) -> Result<String> {
         let stripped = command
             .trim()
@@ -530,6 +701,52 @@ fn parse_branch_commits(raw: &str) -> Vec<BranchCommit> {
             Some(BranchCommit { sha, subject, body })
         })
         .collect()
+}
+
+fn parse_reflog_entries(raw: &str) -> Vec<ReflogEntry> {
+    raw.split('\u{1e}')
+        .filter_map(|record| {
+            let trimmed = record.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+
+            let mut fields = trimmed.splitn(3, '\u{1f}');
+            Some(ReflogEntry {
+                selector: fields.next()?.trim().to_string(),
+                commit: fields.next()?.trim().to_string(),
+                summary: fields.next().unwrap_or("").trim().to_string(),
+            })
+        })
+        .collect()
+}
+
+fn parse_stash_entries(raw: &str) -> Vec<StashEntry> {
+    raw.split('\u{1e}')
+        .filter_map(|record| {
+            let trimmed = record.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+
+            let mut fields = trimmed.splitn(3, '\u{1f}');
+            Some(StashEntry {
+                reference: fields.next()?.trim().to_string(),
+                commit: fields.next()?.trim().to_string(),
+                summary: fields.next().unwrap_or("").trim().to_string(),
+            })
+        })
+        .collect()
+}
+
+fn parse_unreachable_commit_sha(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    let sha = trimmed.strip_prefix("unreachable commit ")?;
+    if sha.is_empty() {
+        None
+    } else {
+        Some(sha.to_string())
+    }
 }
 
 fn shorten_remote_ref(raw: &str) -> String {

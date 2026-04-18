@@ -1,6 +1,6 @@
 # gitgud
 
-`gitgud` is a Rust CLI that adds a terminal UI and AI-assisted Git workflows on top of normal Git.
+`gitgud` is a Rust CLI that adds a terminal UI and guided Git recovery, commit, and push workflows on top of normal Git.
 
 <p align="center">
   <img src="./assets/gitgud-mascot.jpg" alt="gitgud repo mascot" width="280">
@@ -8,6 +8,7 @@
 
 ## What It Does
 
+- Rescues wrong-branch commits, detached HEAD, bad rebases, lost stashes, accidental resets, and force-push mistakes
 - Generates 1-3 commit message options from the staged diff
 - Explains staged changes with intent, risks, and test ideas
 - Suggests exact Git commands from natural language requests
@@ -47,6 +48,7 @@ gg doctor
 Typical usage:
 
 ```bash
+gg rescue
 gg ship
 gg commit
 gg explain
@@ -68,6 +70,7 @@ cargo run --bin gg -- commit
 | Command | Description |
 |---------|-------------|
 | `gg` | Open the home TUI with branch, staged/unstaged counts, and remote status |
+| `gg rescue [incident]` | Diagnose common Git mistakes, preview recovery steps, create a safety snapshot, and save rollback notes |
 | `gg commit` | Generate commit options from staged changes and commit after confirmation |
 | `gg ship` | Run one ship flow: preflight, commit cleanup suggestions, review draft generation, and push |
 | `gg explain` | Explain the staged diff in four sections |
@@ -210,6 +213,9 @@ gg config unset conventional-preset
 
 ## Behavior Notes
 
+- `gg rescue` auto-detects likely recovery incidents, lets you override the incident, previews exact commands, creates a hidden snapshot ref, and saves rollback notes under `.git/gitgud/rescue/`
+- supported rescue incidents are `wrong-branch`, `detached-head`, `bad-rebase`, `lost-stash`, `accidental-reset`, and `force-push`
+- force-push rescue can restore from a detected commit or a manual SHA/ref fallback and only fetches remote refs after confirmation
 - `gg commit` and `gg explain` only use staged changes
 - `gg commit` warns about risky staged diffs, supports inline editing, and can propose split commits for mixed concerns
 - `gg ship` can roll staged work into the existing commit flow first, surfaces split/squash cleanup suggestions for the outgoing branch, drafts a review title/body, and pushes

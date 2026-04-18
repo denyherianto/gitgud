@@ -1,6 +1,6 @@
 use std::{env, error::Error as StdError, ffi::OsString, fmt};
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use clap::Parser;
 use rpassword::prompt_password;
 
@@ -16,8 +16,15 @@ use crate::{
         store_api_token, token_status, unset_config_value,
     },
     git::{GitRepo, PushPlan, push_needs_force_with_lease},
+    rescue::{
+        self, RescueExecutionOutcome, RescueIncident, RescueOption, build_rescue_plan,
+        inspect_rescue_context, manual_ref_prompt, option_requires_manual_ref, suggested_incident,
+    },
     risk,
-    tui::{self, AskAction, CommitAction, ConfigSetupAction, ConfigSetupInput, HomeAction},
+    tui::{
+        self, AskAction, CommitAction, ConfigSetupAction, ConfigSetupInput, HomeAction,
+        RescuePlanAction,
+    },
 };
 
 pub async fn run() -> Result<()> {
@@ -39,6 +46,7 @@ pub async fn run() -> Result<()> {
         Command::Ship => run_ship(&repo).await,
         Command::Explain => run_explain(&repo).await,
         Command::Push => run_push(&repo),
+        Command::Rescue { incident } => run_rescue(&repo, incident),
         Command::Git { args } => run_git_passthrough(&repo, &args),
         Command::Ask { query } => run_ask_command(&repo, &query.join(" ")).await,
         Command::Passthrough(args) => {
@@ -72,6 +80,7 @@ fn resolve_home_command(repo: &GitRepo) -> Result<Option<Command>> {
         HomeAction::Ship => Some(Command::Ship),
         HomeAction::Commit => Some(Command::Commit),
         HomeAction::Push => Some(Command::Push),
+        HomeAction::Rescue => Some(Command::Rescue { incident: None }),
         HomeAction::Quit => None,
     })
 }
@@ -377,6 +386,150 @@ fn execute_push_plan(repo: &GitRepo, plan: &PushPlan) -> Result<()> {
         }
     }
 }
+
+fn run_rescue(repo: &GitRepo, incident: Option<RescueIncident>) -> Result<()> {
+    repo.ensure_git_available()?;
+    repo.ensure_repo()?;
+
+    let context = inspect_rescue_context(repo)?;
+    let selected_incident = match incident {
+        Some(incident) => incident,
+        None => match tui::run_rescue_diagnosis(&context, suggested_incident(&context))? {
+            Some(incident) => incident,
+            None => {
+                println!("rescue cancelled");
+                return Ok(());
+            }
+        },
+    };
+
+    let plan = build_rescue_plan(repo, &context, selected_incident).or_else(|error| {
+        tui::show_message("Cannot Rescue", &error.to_string())?;
+        Err(error)
+    })?;
+
+    if !plan.recommended.is_executable()
+        && plan
+            .alternatives
+            .iter()
+            .all(|option| !option.is_executable())
+    {
+        let message = "No executable recovery steps were found for this incident.";
+        tui::show_message("Nothing To Rescue", message)?;
+        println!("{message}");
+        return Ok(());
+    }
+
+    let action = tui::run_rescue_plan(&plan)?;
+    match action {
+        RescuePlanAction::Recommended => execute_rescue_option(repo, &plan, &plan.recommended),
+        RescuePlanAction::Alternative(index) => {
+            let option = plan
+                .alternatives
+                .get(index)
+                .ok_or_else(|| anyhow!("invalid rescue alternative index: {index}"))?;
+            execute_rescue_option(repo, &plan, option)
+        }
+        RescuePlanAction::Cancel => {
+            println!("rescue cancelled");
+            Ok(())
+        }
+    }
+}
+
+fn execute_rescue_option(
+    repo: &GitRepo,
+    plan: &rescue::RescuePlan,
+    option: &RescueOption,
+) -> Result<()> {
+    if !option.is_executable() {
+        let message = "This rescue option does not have executable steps yet.";
+        tui::show_message("Cannot Execute Rescue", message)?;
+        bail!(message);
+    }
+
+    if option.requires_fetch
+        && !tui::confirm_message(
+            "Fetch Remote State",
+            "This rescue path benefits from refreshing the remote-tracking ref first.\n\nPress Enter to allow `git fetch`, or Esc to keep the current local evidence only.",
+        )?
+    {
+        println!("rescue cancelled");
+        return Ok(());
+    }
+
+    let manual_ref = if option_requires_manual_ref(option) {
+        let (prompt, initial) = manual_ref_prompt(option)
+            .unwrap_or_else(|| ("Enter the commit SHA or ref to restore:".to_string(), None));
+        match tui::prompt_input("Rescue Input", &prompt, initial.as_deref())? {
+            Some(value) => Some(value),
+            None => {
+                println!("rescue cancelled");
+                return Ok(());
+            }
+        }
+    } else {
+        None
+    };
+
+    if option.steps.iter().any(|step| step.mutates_repo)
+        && !tui::confirm_message(
+            "Create Safety Snapshot",
+            "gitgud will create a hidden rescue snapshot ref before it changes branch pointers, stash state, or remote refs.\n\nPress Enter to continue, or Esc to cancel.",
+        )?
+    {
+        println!("rescue cancelled");
+        return Ok(());
+    }
+
+    for (index, step) in option.steps.iter().enumerate() {
+        if !tui::confirm_message(
+            "Execute Rescue Step",
+            &format!(
+                "Step {}/{}\n\n{}\n\n{}",
+                index + 1,
+                option.steps.len(),
+                step.description,
+                render_rescue_step_preview(step, manual_ref.as_deref())
+            ),
+        )? {
+            println!("rescue cancelled");
+            return Ok(());
+        }
+    }
+
+    let outcome = rescue::execute_option(repo, plan, option, manual_ref)?;
+    print_rescue_outcome(&outcome);
+    tui::show_message("Rescue Complete", &outcome.summary.join("\n"))?;
+    Ok(())
+}
+
+fn render_rescue_step_preview(step: &rescue::RescueStep, manual_ref: Option<&str>) -> String {
+    match manual_ref {
+        Some(value) => step.command_preview.replace("<sha-or-ref>", value),
+        None => step.command_preview.clone(),
+    }
+}
+
+fn print_rescue_outcome(outcome: &RescueExecutionOutcome) {
+    println!("Rescue complete:");
+    for line in &outcome.summary {
+        println!("- {line}");
+    }
+    if !outcome.executed_commands.is_empty() {
+        println!("Commands:");
+        for command in &outcome.executed_commands {
+            println!("- {command}");
+        }
+    }
+    if !outcome.rollback.undo_commands.is_empty() {
+        println!("Undo commands:");
+        for command in &outcome.rollback.undo_commands {
+            println!("- {command}");
+        }
+    }
+}
+
 async fn run_explain(repo: &GitRepo) -> Result<()> {
     repo.ensure_git_available()?;
     repo.ensure_repo()?;

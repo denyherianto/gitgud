@@ -2,7 +2,7 @@
 
 ## Context
 
-git-buddy (`gg`) is a Rust CLI that wraps Git with AI-powered commit messages, diff explanations, and safe push flows. Users often know *what* they want to do with Git but not *which command* does it safely. This feature adds a natural language interface: users describe their intent in plain English and get the exact Git command(s) suggested, explained, and optionally executed with safety guardrails.
+gitgud (`gg`) is a Rust CLI that wraps Git with AI-powered commit messages, diff explanations, and safe push flows. Users often know *what* they want to do with Git but not *which command* does it safely. This feature adds a natural language interface: users describe their intent in plain English and get the exact Git command(s) suggested, explained, and optionally executed with safety guardrails.
 
 ## Overview
 
