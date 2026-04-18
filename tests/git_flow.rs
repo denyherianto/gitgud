@@ -404,20 +404,3 @@ fn ship_range_uses_upstream_commits_and_diff() {
     assert!(range.changed_files.iter().any(|path| path == "README.md"));
     assert!(range.diff_stat.contains("README.md"));
 }
-
-#[test]
-fn detects_github_remote_from_git_config() {
-    let repo_dir = init_repo();
-    run(
-        repo_dir.path(),
-        &[
-            "remote",
-            "add",
-            "origin",
-            "git@github.com:denyherianto/gitgud.git",
-        ],
-    );
-
-    let repo = GitRepo::new(repo_dir.path());
-    assert!(repo.has_github_remote().unwrap());
-}

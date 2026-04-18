@@ -18,7 +18,7 @@ pub struct Cli {
 pub enum Command {
     /// Generate 1-3 commit message options for staged changes
     Commit,
-    /// Preflight a branch, clean up commits, draft a PR, push, and optionally open the PR
+    /// Preflight a branch, clean up commits, draft review text, and push
     Ship,
     /// Explain the staged diff, including changes, intent, risks, and tests
     Explain,

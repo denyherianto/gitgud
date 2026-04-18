@@ -203,29 +203,10 @@ async fn run_ship(repo: &GitRepo) -> Result<()> {
     execute_push_plan(repo, &plan)?;
 
     println!();
-    println!("PR title: {}", ship_plan.pr_title);
+    println!("Review title: {}", ship_plan.pr_title);
     println!();
-    println!("PR body:");
+    println!("Review body:");
     println!("{}", ship_plan.pr_body);
-
-    if repo.has_gh_cli() && repo.has_github_remote()? {
-        if tui::confirm_message(
-            "Create Pull Request",
-            "The branch is pushed and a GitHub remote is available.\n\nPress Enter to create a pull request with the generated title and body, or Esc to skip.",
-        )? {
-            let output = repo.create_pull_request(&ship_plan.pr_title, &ship_plan.pr_body)?;
-            if !output.trim().is_empty() {
-                println!();
-                println!("{output}");
-            } else {
-                println!("pull request created");
-            }
-        } else {
-            println!("pull request skipped");
-        }
-    } else {
-        println!("pull request draft generated; GitHub CLI or GitHub remote not available");
-    }
 
     Ok(())
 }

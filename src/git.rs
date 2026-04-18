@@ -360,46 +360,6 @@ impl GitRepo {
         self.run_checked(["push", "-u", remote, branch])
     }
 
-    pub fn has_gh_cli(&self) -> bool {
-        Command::new("gh")
-            .arg("--version")
-            .current_dir(&self.cwd)
-            .output()
-            .map(|output| output.status.success())
-            .unwrap_or(false)
-    }
-
-    pub fn has_github_remote(&self) -> Result<bool> {
-        Ok(self
-            .list_remotes()?
-            .into_iter()
-            .filter_map(|remote| self.remote_url(&remote).ok())
-            .any(|url| is_github_remote_url(&url)))
-    }
-
-    pub fn create_pull_request(&self, title: &str, body: &str) -> Result<String> {
-        let mut command = Command::new("gh");
-        command
-            .current_dir(&self.cwd)
-            .args(["pr", "create", "--title", title, "--body-file", "-"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        let mut child = command.spawn().context("failed to start gh pr create")?;
-        if let Some(stdin) = child.stdin.as_mut() {
-            use std::io::Write;
-            stdin
-                .write_all(body.as_bytes())
-                .context("failed to write PR body to gh pr create")?;
-        }
-
-        let output = child
-            .wait_with_output()
-            .context("failed to wait for gh pr create")?;
-        stringify_external_output(output, "gh pr create")
-    }
-
     fn diff_snapshot(&self, diff_args: &[&str]) -> Result<DiffSnapshot> {
         let mut name_only_args = diff_args.to_vec();
         name_only_args.push("--name-only");
@@ -510,11 +470,6 @@ impl GitRepo {
 
     fn merge_base(&self, left: &str, right: &str) -> Result<String> {
         self.run_checked(["merge-base", left, right])
-            .map(|output| output.trim().to_string())
-    }
-
-    fn remote_url(&self, remote: &str) -> Result<String> {
-        self.run_checked(["remote", "get-url", remote])
             .map(|output| output.trim().to_string())
     }
 
@@ -966,25 +921,6 @@ fn stringify_output(output: Output, context: &str) -> Result<String> {
     }
 }
 
-fn stringify_external_output(output: Output, context: &str) -> Result<String> {
-    if output.status.success() {
-        let stdout = String::from_utf8(output.stdout)
-            .with_context(|| format!("{context} output was not valid UTF-8"))?;
-        if !stdout.trim().is_empty() {
-            Ok(stdout)
-        } else {
-            Ok(String::from_utf8_lossy(&output.stderr).trim().to_string())
-        }
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        bail!(
-            "{context} failed: {}",
-            stderr.trim().if_empty(stdout.trim())
-        )
-    }
-}
-
 fn parse_tracking(status_output: &str) -> Option<String> {
     let line = status_output.lines().next()?;
     let tracking = line.split_once("...")?.1.trim();
@@ -1034,18 +970,12 @@ impl EmptyFallback for str {
     }
 }
 
-fn is_github_remote_url(raw: &str) -> bool {
-    let normalized = raw.trim().to_ascii_lowercase();
-    normalized.contains("github.com")
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         DiffSnapshot, PushPlan, UnsafeDiffWarning, collect_unsafe_diff_warnings,
-        is_github_remote_url, is_lockfile_only_change, looks_minified_line, parse_branch_commits,
-        parse_status_entry, parse_tracking, push_needs_force_with_lease, resolve_push_plan,
-        shorten_remote_ref,
+        is_lockfile_only_change, looks_minified_line, parse_branch_commits, parse_status_entry,
+        parse_tracking, push_needs_force_with_lease, resolve_push_plan, shorten_remote_ref,
     };
 
     #[test]
@@ -1157,13 +1087,6 @@ mod tests {
             shorten_remote_ref("refs/remotes/origin/main"),
             "origin/main"
         );
-    }
-
-    #[test]
-    fn detects_github_remote_urls() {
-        assert!(is_github_remote_url("git@github.com:owner/repo.git"));
-        assert!(is_github_remote_url("https://github.com/owner/repo.git"));
-        assert!(!is_github_remote_url("https://example.com/owner/repo.git"));
     }
 
     fn warning_messages(snapshot: DiffSnapshot) -> Vec<String> {
