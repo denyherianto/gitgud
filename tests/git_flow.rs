@@ -369,3 +369,55 @@ fn warns_for_outgoing_lockfile_only_pushes() {
             .any(|message| message.contains("Only lockfiles changed"))
     );
 }
+
+#[test]
+fn ship_range_uses_upstream_commits_and_diff() {
+    let bare = TempDir::new().unwrap();
+    run(bare.path(), &["init", "--bare"]);
+    let repo_dir = init_repo();
+    run(
+        repo_dir.path(),
+        &["remote", "add", "origin", bare.path().to_str().unwrap()],
+    );
+    run(repo_dir.path(), &["push", "-u", "origin", "main"]);
+
+    fs::write(repo_dir.path().join("README.md"), "hello\nship\n").unwrap();
+    run(repo_dir.path(), &["add", "README.md"]);
+    run(repo_dir.path(), &["commit", "-m", "Prepare ship flow"]);
+
+    let repo = GitRepo::new(repo_dir.path());
+    let range = repo
+        .ship_range(&PushPlan::Upstream {
+            branch: "main".into(),
+        })
+        .unwrap();
+
+    assert_eq!(range.base_label, "origin/main");
+    assert_eq!(
+        range
+            .commits
+            .iter()
+            .map(|commit| commit.subject.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Prepare ship flow"]
+    );
+    assert!(range.changed_files.iter().any(|path| path == "README.md"));
+    assert!(range.diff_stat.contains("README.md"));
+}
+
+#[test]
+fn detects_github_remote_from_git_config() {
+    let repo_dir = init_repo();
+    run(
+        repo_dir.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            "git@github.com:denyherianto/gitgud.git",
+        ],
+    );
+
+    let repo = GitRepo::new(repo_dir.path());
+    assert!(repo.has_github_remote().unwrap());
+}

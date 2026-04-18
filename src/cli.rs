@@ -18,6 +18,8 @@ pub struct Cli {
 pub enum Command {
     /// Generate 1-3 commit message options for staged changes
     Commit,
+    /// Preflight a branch, clean up commits, draft a PR, push, and optionally open the PR
+    Ship,
     /// Explain the staged diff, including changes, intent, risks, and tests
     Explain,
     /// Push the current branch automatically and confirm force-with-lease only when needed
@@ -153,6 +155,16 @@ mod tests {
 
         match cli.command {
             Some(Command::Explain) => {}
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_ship_command() {
+        let cli = Cli::try_parse_from(["gg", "ship"]).unwrap();
+
+        match cli.command {
+            Some(Command::Ship) => {}
             other => panic!("unexpected command: {other:?}"),
         }
     }

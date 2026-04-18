@@ -33,6 +33,22 @@ pub struct StagedChanges {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchCommit {
+    pub sha: String,
+    pub subject: String,
+    pub body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShipRange {
+    pub base_label: String,
+    pub commits: Vec<BranchCommit>,
+    pub changed_files: Vec<String>,
+    pub diff_stat: String,
+    pub diff: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PushPlan {
     Upstream { branch: String },
     SetUpstream { remote: String, branch: String },
@@ -41,6 +57,13 @@ pub enum PushPlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnsafeDiffWarning {
     pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShipBase {
+    diff_base: String,
+    commit_range: Option<String>,
+    base_label: String,
 }
 
 impl GitRepo {
@@ -163,6 +186,28 @@ impl GitRepo {
         let base = self.push_diff_base(plan)?;
         let snapshot = self.diff_snapshot(&["diff", base.as_str(), "HEAD"])?;
         Ok(collect_unsafe_diff_warnings(&snapshot))
+    }
+
+    pub fn ship_range(&self, plan: &PushPlan) -> Result<ShipRange> {
+        let base = self.ship_base(plan)?;
+        let diff_args = ["diff", base.diff_base.as_str(), "HEAD"];
+        let snapshot = self.diff_snapshot(&diff_args)?;
+        let diff_stat = self.run_checked([
+            "diff",
+            "--stat",
+            "--compact-summary",
+            base.diff_base.as_str(),
+            "HEAD",
+        ])?;
+        let commits = self.ship_commits(&base)?;
+
+        Ok(ShipRange {
+            base_label: base.base_label,
+            commits,
+            changed_files: snapshot.changed_files,
+            diff_stat,
+            diff: snapshot.diff,
+        })
     }
 
     pub fn commit(&self, message: &str) -> Result<String> {
@@ -315,6 +360,46 @@ impl GitRepo {
         self.run_checked(["push", "-u", remote, branch])
     }
 
+    pub fn has_gh_cli(&self) -> bool {
+        Command::new("gh")
+            .arg("--version")
+            .current_dir(&self.cwd)
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+
+    pub fn has_github_remote(&self) -> Result<bool> {
+        Ok(self
+            .list_remotes()?
+            .into_iter()
+            .filter_map(|remote| self.remote_url(&remote).ok())
+            .any(|url| is_github_remote_url(&url)))
+    }
+
+    pub fn create_pull_request(&self, title: &str, body: &str) -> Result<String> {
+        let mut command = Command::new("gh");
+        command
+            .current_dir(&self.cwd)
+            .args(["pr", "create", "--title", title, "--body-file", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let mut child = command.spawn().context("failed to start gh pr create")?;
+        if let Some(stdin) = child.stdin.as_mut() {
+            use std::io::Write;
+            stdin
+                .write_all(body.as_bytes())
+                .context("failed to write PR body to gh pr create")?;
+        }
+
+        let output = child
+            .wait_with_output()
+            .context("failed to wait for gh pr create")?;
+        stringify_external_output(output, "gh pr create")
+    }
+
     fn diff_snapshot(&self, diff_args: &[&str]) -> Result<DiffSnapshot> {
         let mut name_only_args = diff_args.to_vec();
         name_only_args.push("--name-only");
@@ -336,6 +421,59 @@ impl GitRepo {
         })
     }
 
+    fn ship_base(&self, plan: &PushPlan) -> Result<ShipBase> {
+        match plan {
+            PushPlan::Upstream { .. } => {
+                let upstream = self.upstream_ref()?;
+                Ok(ShipBase {
+                    diff_base: upstream.clone(),
+                    commit_range: Some(format!("{upstream}..HEAD")),
+                    base_label: upstream,
+                })
+            }
+            PushPlan::SetUpstream { remote, branch } => {
+                let remote_branch_ref = format!("refs/remotes/{remote}/{branch}");
+                if let Ok(output) =
+                    self.run_checked_slice(&["rev-parse", "--verify", remote_branch_ref.as_str()])
+                {
+                    let remote_sha = output.trim().to_string();
+                    return Ok(ShipBase {
+                        diff_base: remote_sha.clone(),
+                        commit_range: Some(format!("{remote_sha}..HEAD")),
+                        base_label: format!("{remote}/{branch}"),
+                    });
+                }
+
+                if let Some(default_ref) = self.remote_default_branch(remote)? {
+                    let merge_base = self.merge_base("HEAD", default_ref.as_str())?;
+                    return Ok(ShipBase {
+                        diff_base: merge_base.clone(),
+                        commit_range: Some(format!("{merge_base}..HEAD")),
+                        base_label: shorten_remote_ref(&default_ref),
+                    });
+                }
+
+                Ok(ShipBase {
+                    diff_base: EMPTY_TREE_HASH.to_string(),
+                    commit_range: None,
+                    base_label: "repo start".to_string(),
+                })
+            }
+        }
+    }
+
+    fn ship_commits(&self, base: &ShipBase) -> Result<Vec<BranchCommit>> {
+        let mut args = vec!["log", "--reverse", "--format=%H%x1f%s%x1f%b%x1e"];
+        if let Some(range) = &base.commit_range {
+            args.push(range.as_str());
+        } else {
+            args.push("HEAD");
+        }
+
+        let output = self.run_checked_slice(&args)?;
+        Ok(parse_branch_commits(&output))
+    }
+
     fn push_diff_base(&self, plan: &PushPlan) -> Result<String> {
         match plan {
             PushPlan::Upstream { .. } => Ok("@{u}".to_string()),
@@ -348,6 +486,36 @@ impl GitRepo {
                 }
             }
         }
+    }
+
+    fn upstream_ref(&self) -> Result<String> {
+        self.run_checked(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
+            .map(|output| output.trim().to_string())
+    }
+
+    fn remote_default_branch(&self, remote: &str) -> Result<Option<String>> {
+        let remote_head = format!("refs/remotes/{remote}/HEAD");
+        match self.run_checked_slice(&["symbolic-ref", remote_head.as_str()]) {
+            Ok(output) => {
+                let value = output.trim();
+                if value.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(value.to_string()))
+                }
+            }
+            Err(_) => Ok(None),
+        }
+    }
+
+    fn merge_base(&self, left: &str, right: &str) -> Result<String> {
+        self.run_checked(["merge-base", left, right])
+            .map(|output| output.trim().to_string())
+    }
+
+    fn remote_url(&self, remote: &str) -> Result<String> {
+        self.run_checked(["remote", "get-url", remote])
+            .map(|output| output.trim().to_string())
     }
 
     fn run_checked<const N: usize>(&self, args: [&str; N]) -> Result<String> {
@@ -389,6 +557,31 @@ fn format_git_command(args: &[OsString]) -> String {
     } else {
         format!("git {rendered}")
     }
+}
+
+fn parse_branch_commits(raw: &str) -> Vec<BranchCommit> {
+    raw.split('\u{1e}')
+        .filter_map(|record| {
+            let trimmed = record.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+
+            let mut fields = trimmed.splitn(3, '\u{1f}');
+            let sha = fields.next()?.trim().to_string();
+            let subject = fields.next()?.trim().to_string();
+            let body = fields.next().unwrap_or("").trim().to_string();
+
+            Some(BranchCommit { sha, subject, body })
+        })
+        .collect()
+}
+
+fn shorten_remote_ref(raw: &str) -> String {
+    raw.trim()
+        .strip_prefix("refs/remotes/")
+        .unwrap_or(raw.trim())
+        .to_string()
 }
 
 fn validate_split_plan(plans: &[SplitCommitPlan], staged_files: &[String]) -> Result<()> {
@@ -773,6 +966,25 @@ fn stringify_output(output: Output, context: &str) -> Result<String> {
     }
 }
 
+fn stringify_external_output(output: Output, context: &str) -> Result<String> {
+    if output.status.success() {
+        let stdout = String::from_utf8(output.stdout)
+            .with_context(|| format!("{context} output was not valid UTF-8"))?;
+        if !stdout.trim().is_empty() {
+            Ok(stdout)
+        } else {
+            Ok(String::from_utf8_lossy(&output.stderr).trim().to_string())
+        }
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        bail!(
+            "{context} failed: {}",
+            stderr.trim().if_empty(stdout.trim())
+        )
+    }
+}
+
 fn parse_tracking(status_output: &str) -> Option<String> {
     let line = status_output.lines().next()?;
     let tracking = line.split_once("...")?.1.trim();
@@ -822,12 +1034,18 @@ impl EmptyFallback for str {
     }
 }
 
+fn is_github_remote_url(raw: &str) -> bool {
+    let normalized = raw.trim().to_ascii_lowercase();
+    normalized.contains("github.com")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         DiffSnapshot, PushPlan, UnsafeDiffWarning, collect_unsafe_diff_warnings,
-        is_lockfile_only_change, looks_minified_line, parse_status_entry, parse_tracking,
-        push_needs_force_with_lease, resolve_push_plan,
+        is_github_remote_url, is_lockfile_only_change, looks_minified_line, parse_branch_commits,
+        parse_status_entry, parse_tracking, push_needs_force_with_lease, resolve_push_plan,
+        shorten_remote_ref,
     };
 
     #[test]
@@ -918,6 +1136,34 @@ mod tests {
         assert!(push_needs_force_with_lease(
             "Updates were rejected because the remote contains work that you do not have locally. Fetch first."
         ));
+    }
+
+    #[test]
+    fn parses_branch_commit_log_records() {
+        let commits = parse_branch_commits(
+            "abc123\x1fAdd ship flow\x1fBody line\x1e\ndef456\x1fFix tests\x1f\x1e",
+        );
+
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0].sha, "abc123");
+        assert_eq!(commits[0].subject, "Add ship flow");
+        assert_eq!(commits[0].body, "Body line");
+        assert_eq!(commits[1].subject, "Fix tests");
+    }
+
+    #[test]
+    fn strips_remote_ref_prefix_for_display() {
+        assert_eq!(
+            shorten_remote_ref("refs/remotes/origin/main"),
+            "origin/main"
+        );
+    }
+
+    #[test]
+    fn detects_github_remote_urls() {
+        assert!(is_github_remote_url("git@github.com:owner/repo.git"));
+        assert!(is_github_remote_url("https://github.com/owner/repo.git"));
+        assert!(!is_github_remote_url("https://example.com/owner/repo.git"));
     }
 
     fn warning_messages(snapshot: DiffSnapshot) -> Vec<String> {

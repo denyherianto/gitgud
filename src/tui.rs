@@ -36,6 +36,7 @@ type Backend = CrosstermBackend<Stdout>;
 type AppTerminal = Terminal<Backend>;
 
 pub enum HomeAction {
+    Ship,
     Commit,
     Push,
     Quit,
@@ -88,6 +89,7 @@ pub fn run_home(status: &RepoStatus) -> Result<HomeAction> {
 
             if let Event::Key(key) = event::read()? {
                 match key.code {
+                    KeyCode::Char('s') => return Ok(HomeAction::Ship),
                     KeyCode::Char('c') => return Ok(HomeAction::Commit),
                     KeyCode::Char('p') => return Ok(HomeAction::Push),
                     KeyCode::Esc | KeyCode::Char('q') => return Ok(HomeAction::Quit),
@@ -168,6 +170,22 @@ pub fn show_message(title: &str, message: &str) -> Result<()> {
             if let Event::Key(key) = event::read()? {
                 match key.code {
                     KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q') => return Ok(()),
+                    _ => {}
+                }
+            }
+        }
+    })
+}
+
+pub fn confirm_message(title: &str, message: &str) -> Result<bool> {
+    with_terminal(|terminal| {
+        loop {
+            terminal.draw(|frame| draw_message(frame, title, message))?;
+
+            if let Event::Key(key) = event::read()? {
+                match key.code {
+                    KeyCode::Enter => return Ok(true),
+                    KeyCode::Esc | KeyCode::Char('q') => return Ok(false),
                     _ => {}
                 }
             }
@@ -712,6 +730,7 @@ fn draw_home(frame: &mut ratatui::Frame<'_>, status: &RepoStatus) {
     .alignment(Alignment::Left);
 
     let shortcuts = Paragraph::new(vec![
+        Line::from("s  ship branch"),
         Line::from("c  commit staged changes"),
         Line::from("p  push current branch"),
         Line::from("q  quit"),

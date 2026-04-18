@@ -133,6 +133,35 @@ pub struct AskContext {
     pub recent_log: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShipCommit {
+    pub subject: String,
+    pub body: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ShipPromptInput {
+    pub branch: String,
+    pub base_label: String,
+    pub staged_count: usize,
+    pub unstaged_count: usize,
+    pub local_commits: Vec<ShipCommit>,
+    pub changed_files: Vec<String>,
+    pub diff_stat: String,
+    pub diff: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShipPlan {
+    pub preflight_checks: Vec<String>,
+    pub commit_cleanup: Vec<String>,
+    pub split_suggestions: Vec<String>,
+    pub squash_suggestions: Vec<String>,
+    pub pr_title: String,
+    pub pr_body: String,
+    pub note: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct AiClient {
     config: AiConfig,
@@ -230,6 +259,26 @@ impl AiClient {
         parse_ask_suggestion(&content)
     }
 
+    pub async fn generate_ship_plan(&self, input: &ShipPromptInput) -> Result<ShipPlan> {
+        match self.config.generation_mode {
+            GenerationMode::Auto => match self.generate_ship_plan_from_provider(input).await {
+                Ok(plan) => Ok(plan),
+                Err(error) if is_timeout_error(&error) => {
+                    let mut plan = build_heuristic_ship_plan(input);
+                    plan.note = Some("AI timed out. Showing heuristic ship plan.".to_string());
+                    Ok(plan)
+                }
+                Err(error) => Err(error),
+            },
+            GenerationMode::AiOnly => self.generate_ship_plan_from_provider(input).await,
+            GenerationMode::HeuristicOnly => {
+                let mut plan = build_heuristic_ship_plan(input);
+                plan.note = Some("Using heuristic ship plan only.".to_string());
+                Ok(plan)
+            }
+        }
+    }
+
     async fn generate_commit_suggestions_from_provider(
         &self,
         input: &PromptInput,
@@ -247,6 +296,14 @@ impl AiClient {
             input.commit_style,
             &input.conventional_preset,
         )
+    }
+
+    async fn generate_ship_plan_from_provider(&self, input: &ShipPromptInput) -> Result<ShipPlan> {
+        let content = self
+            .request_chat_completion(build_ship_system_prompt(), build_ship_user_prompt(input))
+            .await?;
+
+        parse_ship_plan(&content)
     }
 
     async fn request_chat_completion(
@@ -508,6 +565,113 @@ pub fn build_heuristic_commit_options(input: &PromptInput) -> Vec<String> {
     build_heuristic_commit_suggestions(input).options
 }
 
+pub fn build_heuristic_ship_plan(input: &ShipPromptInput) -> ShipPlan {
+    let mut preflight_checks = Vec::new();
+    if input.staged_count > 0 {
+        preflight_checks.push(format!(
+            "{} staged file(s) still need a commit before shipping.",
+            input.staged_count
+        ));
+    }
+    if input.unstaged_count > 0 {
+        preflight_checks.push(format!(
+            "{} unstaged file(s) will stay out of the push.",
+            input.unstaged_count
+        ));
+    }
+    if !input.local_commits.is_empty() {
+        preflight_checks.push(format!(
+            "{} local commit(s) will be compared against {}.",
+            input.local_commits.len(),
+            input.base_label
+        ));
+    }
+    if !input.changed_files.is_empty() {
+        preflight_checks.push(format!(
+            "{} file(s) changed in the outgoing diff.",
+            input.changed_files.len()
+        ));
+    }
+
+    let mut commit_cleanup = Vec::new();
+    let mut split_suggestions = Vec::new();
+    let mut squash_suggestions = Vec::new();
+
+    let subjects = input
+        .local_commits
+        .iter()
+        .map(|commit| commit.subject.trim())
+        .filter(|subject| !subject.is_empty())
+        .collect::<Vec<_>>();
+    let lowered_subjects = subjects
+        .iter()
+        .map(|subject| subject.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+
+    if lowered_subjects.iter().any(|subject| {
+        ["wip", "tmp", "fixup!", "squash!", "oops", "review", "typo"]
+            .iter()
+            .any(|needle| subject.contains(needle))
+    }) {
+        commit_cleanup.push(
+            "Clean up temporary or review-only commit subjects before opening the PR.".to_string(),
+        );
+    }
+
+    if input.local_commits.len() >= 5 {
+        squash_suggestions.push(format!(
+            "The branch has {} local commits. Squash the follow-up noise before review if the history is hard to scan.",
+            input.local_commits.len()
+        ));
+    }
+
+    let small_fixups = lowered_subjects
+        .iter()
+        .filter(|subject| {
+            subject.starts_with("fix")
+                || subject.starts_with("chore")
+                || subject.contains("lint")
+                || subject.contains("format")
+        })
+        .count();
+    if small_fixups >= 2 {
+        squash_suggestions.push(
+            "Combine the follow-up fix/lint commits into the main change before shipping."
+                .to_string(),
+        );
+    }
+
+    let mut path_groups = BTreeMap::new();
+    for path in &input.changed_files {
+        let group = classify_ship_path(path);
+        *path_groups.entry(group).or_insert(0usize) += 1;
+    }
+    if path_groups.len() >= 3 {
+        split_suggestions.push(
+            "The outgoing diff spans several areas. Consider splitting product code, tests, and docs into separate review units."
+                .to_string(),
+        );
+    } else if path_groups.contains_key("docs") && path_groups.contains_key("tests") {
+        split_suggestions.push(
+            "Documentation and test-only changes are mixed together. A cleaner stack may be easier to review."
+                .to_string(),
+        );
+    }
+
+    let pr_title = fallback_pr_title(input);
+    let pr_body = build_heuristic_pr_body(input, &subjects);
+
+    ShipPlan {
+        preflight_checks,
+        commit_cleanup,
+        split_suggestions,
+        squash_suggestions,
+        pr_title,
+        pr_body,
+        note: None,
+    }
+}
+
 fn build_system_prompt(
     commit_style: CommitStyle,
     conventional_preset: &ResolvedConventionalPreset,
@@ -546,6 +710,47 @@ fn build_ask_user_prompt(query: &str, context: &AskContext) -> String {
     format!(
         "Query: {}\n\nContext:\nBranch: {}\nStaged files: {}\nUnstaged files: {}\nRecent commits:\n{}",
         query, context.branch, context.staged_count, context.unstaged_count, log
+    )
+}
+
+fn build_ship_system_prompt() -> String {
+    r#"You help engineers prepare a Git branch for shipping. Return valid JSON only with this shape: {"preflight_checks":["item 1"],"commit_cleanup":["item 1"],"split_suggestions":["item 1"],"squash_suggestions":["item 1"],"pr_title":"...","pr_body":"..."}. Each array may contain 0 to 4 concise strings. `preflight_checks` should call out concrete repo state to verify before pushing. `commit_cleanup` should flag message polish, noisy commits, or review hygiene. `split_suggestions` should only appear when the outgoing diff still looks like multiple concerns that should be separate. `squash_suggestions` should only appear when the branch history looks noisy or overly granular. `pr_title` must be a concise review-ready title under 72 characters. `pr_body` must be Markdown with these exact headings: `## Summary`, `## Testing`, and `## Risks`. Base everything on the provided branch context, local commits, and outgoing diff. Do not use markdown fences or extra commentary."#.to_string()
+}
+
+fn build_ship_user_prompt(input: &ShipPromptInput) -> String {
+    let commits = if input.local_commits.is_empty() {
+        "(none)".to_string()
+    } else {
+        input
+            .local_commits
+            .iter()
+            .enumerate()
+            .map(|(index, commit)| {
+                if commit.body.trim().is_empty() {
+                    format!("{}. {}", index + 1, commit.subject)
+                } else {
+                    format!("{}. {}\n{}", index + 1, commit.subject, commit.body)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    };
+    let changed_files = if input.changed_files.is_empty() {
+        "(none)".to_string()
+    } else {
+        input.changed_files.join(", ")
+    };
+
+    format!(
+        "Branch: {}\nBase branch: {}\nStaged files: {}\nUnstaged files: {}\nChanged files: {}\n\nLocal commits:\n{}\n\nOutgoing diff stat:\n{}\n\nOutgoing diff:\n{}",
+        input.branch,
+        input.base_label,
+        input.staged_count,
+        input.unstaged_count,
+        changed_files,
+        commits,
+        input.diff_stat,
+        truncate_diff(&input.diff, DEFAULT_MAX_DIFF_CHARS)
     )
 }
 
@@ -603,6 +808,34 @@ fn parse_ask_suggestion(raw: &str) -> Result<AskSuggestion> {
         }),
         explanation: parsed.explanation,
         teaching_note: parsed.teaching_note,
+    })
+}
+
+fn parse_ship_plan(raw: &str) -> Result<ShipPlan> {
+    let json = raw.trim();
+
+    let parsed: ShipPlanPayload = if let Ok(p) = serde_json::from_str(json) {
+        p
+    } else if let Some(stripped) = strip_code_fence(json) {
+        serde_json::from_str(stripped).context("failed to parse ship plan JSON")?
+    } else {
+        bail!("failed to parse ship plan JSON");
+    };
+
+    let title = ensure_short_pr_title(&parsed.pr_title);
+    let body = normalize_pr_body(&parsed.pr_body);
+    if body.trim().is_empty() {
+        bail!("AI provider returned an empty PR body");
+    }
+
+    Ok(ShipPlan {
+        preflight_checks: parsed.preflight_checks,
+        commit_cleanup: parsed.commit_cleanup,
+        split_suggestions: parsed.split_suggestions,
+        squash_suggestions: parsed.squash_suggestions,
+        pr_title: title,
+        pr_body: body,
+        note: None,
     })
 }
 
@@ -826,6 +1059,141 @@ fn strip_code_fence(raw: &str) -> Option<&str> {
         .unwrap_or(stripped);
     let stripped = stripped.strip_prefix('\n').unwrap_or(stripped);
     stripped.strip_suffix("```").map(str::trim)
+}
+
+fn ensure_short_pr_title(raw: &str) -> String {
+    let normalized = raw.trim().trim_matches('"');
+    let title = if normalized.is_empty() {
+        "Update branch for review".to_string()
+    } else {
+        normalized.to_string()
+    };
+    limit_subject_to_72(strip_conventional_prefix(&title))
+}
+
+fn normalize_pr_body(raw: &str) -> String {
+    raw.replace("\r\n", "\n").trim().to_string()
+}
+
+fn fallback_pr_title(input: &ShipPromptInput) -> String {
+    if let Some(subject) = input
+        .local_commits
+        .iter()
+        .map(|commit| commit.subject.trim())
+        .find(|subject| {
+            let lowered = subject.to_ascii_lowercase();
+            !lowered.starts_with("fixup!")
+                && !lowered.starts_with("squash!")
+                && !lowered.starts_with("wip")
+                && !subject.is_empty()
+        })
+    {
+        return ensure_short_pr_title(subject);
+    }
+
+    let summary_input = PromptInput {
+        branch: input.branch.clone(),
+        staged_files: input.changed_files.clone(),
+        diff_stat: input.diff_stat.clone(),
+        diff: input.diff.clone(),
+        commit_style: CommitStyle::Standard,
+        conventional_preset: ResolvedConventionalPreset::built_in_default(),
+    };
+    let fallback = build_heuristic_commit_options(&summary_input)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| "Update branch for review".to_string());
+    ensure_short_pr_title(&fallback)
+}
+
+fn build_heuristic_pr_body(input: &ShipPromptInput, subjects: &[&str]) -> String {
+    let mut summary_items = subjects
+        .iter()
+        .map(|subject| strip_conventional_prefix(subject))
+        .filter(|subject| !subject.is_empty())
+        .take(3)
+        .map(|subject| format!("- {subject}"))
+        .collect::<Vec<_>>();
+    if summary_items.is_empty() {
+        summary_items = input
+            .changed_files
+            .iter()
+            .take(3)
+            .map(|path| format!("- Touches `{path}`"))
+            .collect();
+    }
+    if summary_items.is_empty() {
+        summary_items.push("- Review the outgoing branch diff.".to_string());
+    }
+
+    let mut risk_items = infer_ship_risks(input);
+    if risk_items.is_empty() {
+        risk_items.push("- Review the branch diff for behavior changes before merge.".to_string());
+    }
+
+    format!(
+        "## Summary\n{}\n\n## Testing\n- Not run (update before merge)\n\n## Risks\n{}",
+        summary_items.join("\n"),
+        risk_items.join("\n")
+    )
+}
+
+fn infer_ship_risks(input: &ShipPromptInput) -> Vec<String> {
+    let mut items = Vec::new();
+    if input
+        .changed_files
+        .iter()
+        .any(|path| path.ends_with(".env"))
+    {
+        items.push("- Double-check that no secrets are included in the branch.".to_string());
+    }
+    if input
+        .changed_files
+        .iter()
+        .any(|path| path.ends_with(".lock") || path.ends_with("Cargo.lock"))
+    {
+        items.push("- Verify that dependency lockfile updates are intentional.".to_string());
+    }
+    if input
+        .changed_files
+        .iter()
+        .any(|path| path.starts_with(".github/workflows/"))
+    {
+        items.push("- CI workflow changes can affect release or test automation.".to_string());
+    }
+    items
+}
+
+fn classify_ship_path(path: &str) -> &'static str {
+    if path.starts_with("tests/") || path.contains("/tests/") {
+        "tests"
+    } else if path == "README.md" || path.starts_with("docs/") {
+        "docs"
+    } else if path.starts_with(".github/") {
+        "ops"
+    } else {
+        "code"
+    }
+}
+
+fn strip_conventional_prefix(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let Some((head, rest)) = trimmed.split_once(": ") else {
+        return trimmed.to_string();
+    };
+
+    let head = head.strip_suffix('!').unwrap_or(head);
+    let commit_type = head.split_once('(').map(|(kind, _)| kind).unwrap_or(head);
+    let is_conventional = !commit_type.is_empty()
+        && commit_type
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch == '-');
+
+    if is_conventional {
+        rest.trim().to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn validate_conventional_subject(subject: &str, allowed_types: &[String]) -> Result<()> {
@@ -1567,6 +1935,20 @@ struct AskSuggestionPayload {
 }
 
 #[derive(Debug, Deserialize)]
+struct ShipPlanPayload {
+    #[serde(default)]
+    preflight_checks: Vec<String>,
+    #[serde(default)]
+    commit_cleanup: Vec<String>,
+    #[serde(default)]
+    split_suggestions: Vec<String>,
+    #[serde(default)]
+    squash_suggestions: Vec<String>,
+    pr_title: String,
+    pr_body: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct SuggestedCommandPayload {
     command: String,
     description: String,
@@ -1631,12 +2013,14 @@ mod tests {
 
     use super::{
         AiConfig, AskContext, AskSuggestion, DEFAULT_BASE_API_URL, DiffExplanation, ModelPayload,
-        SplitCommitPlan, SuggestedCommand, build_ask_user_prompt, build_commit_prompt,
-        build_diff_explanation_prompt, build_heuristic_commit_options,
-        build_heuristic_commit_suggestions, collect_model_options, normalize_base_api_url,
-        parse_ask_suggestion, parse_commit_options, parse_commit_suggestions,
-        parse_commit_suggestions_with_preset, parse_diff_explanation, truncate_diff,
-        validate_commit_message, validate_commit_message_with_preset,
+        ShipCommit, ShipPlan, ShipPromptInput, SplitCommitPlan, SuggestedCommand,
+        build_ask_user_prompt, build_commit_prompt, build_diff_explanation_prompt,
+        build_heuristic_commit_options, build_heuristic_commit_suggestions,
+        build_heuristic_ship_plan, build_ship_user_prompt, collect_model_options,
+        normalize_base_api_url, parse_ask_suggestion, parse_commit_options,
+        parse_commit_suggestions, parse_commit_suggestions_with_preset, parse_diff_explanation,
+        parse_ship_plan, truncate_diff, validate_commit_message,
+        validate_commit_message_with_preset,
     };
     use crate::config::{CommitStyle, GenerationMode, Provider, ResolvedConventionalPreset};
 
@@ -2119,5 +2503,84 @@ mod tests {
         assert!(prompt.contains("Branch: main"));
         assert!(prompt.contains("Staged files: 2"));
         assert!(prompt.contains("abc1234 feat: add login"));
+    }
+
+    #[test]
+    fn parses_ship_plan_json() {
+        let plan = parse_ship_plan(
+            r###"{"preflight_checks":["Push 3 local commits"],"commit_cleanup":["Clean up WIP subjects"],"split_suggestions":["Split docs from code"],"squash_suggestions":["Squash fixup commits"],"pr_title":"feat(cli): add ship workflow","pr_body":"## Summary\n- Add ship workflow\n\n## Testing\n- cargo test\n\n## Risks\n- Check push target"}"###,
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan,
+            ShipPlan {
+                preflight_checks: vec!["Push 3 local commits".into()],
+                commit_cleanup: vec!["Clean up WIP subjects".into()],
+                split_suggestions: vec!["Split docs from code".into()],
+                squash_suggestions: vec!["Squash fixup commits".into()],
+                pr_title: "add ship workflow".into(),
+                pr_body:
+                    "## Summary\n- Add ship workflow\n\n## Testing\n- cargo test\n\n## Risks\n- Check push target"
+                        .into(),
+                note: None,
+            }
+        );
+    }
+
+    #[test]
+    fn builds_ship_user_prompt_with_context() {
+        let prompt = build_ship_user_prompt(&ShipPromptInput {
+            branch: "feature/ship".into(),
+            base_label: "origin/main".into(),
+            staged_count: 0,
+            unstaged_count: 1,
+            local_commits: vec![ShipCommit {
+                subject: "feat(cli): add ship workflow".into(),
+                body: "Add PR drafting after push.".into(),
+            }],
+            changed_files: vec!["src/app.rs".into(), "README.md".into()],
+            diff_stat: "2 files changed".into(),
+            diff: "diff --git a/src/app.rs b/src/app.rs\n+run ship".into(),
+        });
+
+        assert!(prompt.contains("Branch: feature/ship"));
+        assert!(prompt.contains("Base branch: origin/main"));
+        assert!(prompt.contains("feat(cli): add ship workflow"));
+        assert!(prompt.contains("README.md"));
+    }
+
+    #[test]
+    fn heuristic_ship_plan_flags_fixups_and_builds_pr_body() {
+        let plan = build_heuristic_ship_plan(&ShipPromptInput {
+            branch: "feature/ship".into(),
+            base_label: "origin/main".into(),
+            staged_count: 0,
+            unstaged_count: 0,
+            local_commits: vec![
+                ShipCommit {
+                    subject: "feat(cli): add ship workflow".into(),
+                    body: String::new(),
+                },
+                ShipCommit {
+                    subject: "fixup! feat(cli): add ship workflow".into(),
+                    body: String::new(),
+                },
+                ShipCommit {
+                    subject: "chore: lint".into(),
+                    body: String::new(),
+                },
+            ],
+            changed_files: vec!["src/app.rs".into(), "tests/git_flow.rs".into()],
+            diff_stat: "2 files changed".into(),
+            diff: "diff --git a/src/app.rs b/src/app.rs\n+run ship".into(),
+        });
+
+        assert!(!plan.commit_cleanup.is_empty());
+        assert!(!plan.squash_suggestions.is_empty());
+        assert_eq!(plan.pr_title, "add ship workflow");
+        assert!(plan.pr_body.contains("## Summary"));
+        assert!(plan.pr_body.contains("## Testing"));
+        assert!(plan.pr_body.contains("## Risks"));
     }
 }

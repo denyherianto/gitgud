@@ -5,14 +5,17 @@ use clap::Parser;
 use rpassword::prompt_password;
 
 use crate::{
-    ai::{AiClient, AiConfig, AskContext, DiffExplanation, PromptInput, SuggestedCommand},
+    ai::{
+        AiClient, AiConfig, AskContext, DiffExplanation, PromptInput, ShipCommit, ShipPlan,
+        ShipPromptInput, SuggestedCommand, build_heuristic_ship_plan,
+    },
     cli::{AuthCommand, Cli, Command, ConfigCommand},
     config::{
         GenerationMode, TokenStatus, config_path, delete_api_token, load_api_token, load_file,
         resolve_ai_settings, resolve_non_secret_settings, save_file_to_path, set_config_value,
         store_api_token, token_status, unset_config_value,
     },
-    git::{GitRepo, push_needs_force_with_lease},
+    git::{GitRepo, PushPlan, push_needs_force_with_lease},
     risk,
     tui::{self, AskAction, CommitAction, ConfigSetupAction, ConfigSetupInput, HomeAction},
 };
@@ -33,6 +36,7 @@ pub async fn run() -> Result<()> {
 
     match command {
         Command::Commit => run_commit(&repo).await,
+        Command::Ship => run_ship(&repo).await,
         Command::Explain => run_explain(&repo).await,
         Command::Push => run_push(&repo),
         Command::Git { args } => run_git_passthrough(&repo, &args),
@@ -65,6 +69,7 @@ fn resolve_home_command(repo: &GitRepo) -> Result<Option<Command>> {
 
     let status = repo.status()?;
     Ok(match tui::run_home(&status)? {
+        HomeAction::Ship => Some(Command::Ship),
         HomeAction::Commit => Some(Command::Commit),
         HomeAction::Push => Some(Command::Push),
         HomeAction::Quit => None,
@@ -108,15 +113,125 @@ async fn run_commit(repo: &GitRepo) -> Result<()> {
         }
     };
 
-    match tui::run_commit(
+    execute_commit_action(
         repo,
-        generator,
-        settings.commit_style.value,
-        settings.generation_mode.value,
-        settings.conventional_preset.value,
+        tui::run_commit(
+            repo,
+            generator,
+            settings.commit_style.value,
+            settings.generation_mode.value,
+            settings.conventional_preset.value,
+        )
+        .await?,
     )
-    .await?
+}
+
+async fn run_ship(repo: &GitRepo) -> Result<()> {
+    repo.ensure_git_available()?;
+    repo.ensure_repo()?;
+
+    let initial_status = repo.status()?;
+    if initial_status.staged_count > 0 || initial_status.unstaged_count > 0 {
+        println!(
+            "preflight: {} staged, {} unstaged",
+            initial_status.staged_count, initial_status.unstaged_count
+        );
+        run_commit(repo).await?;
+    }
+
+    let status = repo.status()?;
+    if (status.staged_count > 0 || status.unstaged_count > 0)
+        && !tui::confirm_message(
+            "Ship Preflight",
+            &format!(
+                "{} staged file(s) and {} unstaged file(s) are still outside the branch you are about to ship.\n\nPress Enter to continue with the current commit stack, or Esc to cancel.",
+                status.staged_count, status.unstaged_count
+            ),
+        )?
     {
+        println!("ship cancelled");
+        return Ok(());
+    }
+
+    let plan = repo.plan_push().or_else(|error| {
+        tui::show_message("Cannot Ship", &error.to_string())?;
+        Err(error)
+    })?;
+    let ship_range = repo.ship_range(&plan)?;
+    if ship_range.commits.is_empty() {
+        let message = "No local commits found to ship from the current branch.";
+        tui::show_message("Nothing To Ship", message)?;
+        println!("{message}");
+        return Ok(());
+    }
+
+    let warnings = repo.push_diff_warnings(&plan)?;
+    if !warnings.is_empty() && !tui::confirm_unsafe_diff_warnings("shipping", &warnings)? {
+        println!("ship cancelled");
+        return Ok(());
+    }
+
+    let ship_plan = build_ship_plan(
+        &status,
+        &ship_range.base_label,
+        &ship_range.commits,
+        &ship_range.changed_files,
+        &ship_range.diff_stat,
+        &ship_range.diff,
+    )
+    .await?;
+    print_ship_plan(&status, &plan, &ship_range.base_label, &ship_plan);
+
+    if has_cleanup_suggestions(&ship_plan)
+        && !tui::confirm_message(
+            "Commit Cleanup Suggestions",
+            "gitgud found split, squash, or cleanup suggestions for this branch.\n\nPress Enter to keep shipping with the current history, or Esc to cancel and clean it up first.",
+        )?
+    {
+        println!("ship cancelled");
+        return Ok(());
+    }
+
+    if !tui::confirm_message(
+        "Ready To Push",
+        "Press Enter to push this branch now, or Esc to cancel.",
+    )? {
+        println!("ship cancelled");
+        return Ok(());
+    }
+
+    execute_push_plan(repo, &plan)?;
+
+    println!();
+    println!("PR title: {}", ship_plan.pr_title);
+    println!();
+    println!("PR body:");
+    println!("{}", ship_plan.pr_body);
+
+    if repo.has_gh_cli() && repo.has_github_remote()? {
+        if tui::confirm_message(
+            "Create Pull Request",
+            "The branch is pushed and a GitHub remote is available.\n\nPress Enter to create a pull request with the generated title and body, or Esc to skip.",
+        )? {
+            let output = repo.create_pull_request(&ship_plan.pr_title, &ship_plan.pr_body)?;
+            if !output.trim().is_empty() {
+                println!();
+                println!("{output}");
+            } else {
+                println!("pull request created");
+            }
+        } else {
+            println!("pull request skipped");
+        }
+    } else {
+        println!("pull request draft generated; GitHub CLI or GitHub remote not available");
+    }
+
+    Ok(())
+}
+
+fn execute_commit_action(repo: &GitRepo, action: CommitAction) -> Result<()> {
+    match action {
         CommitAction::Confirmed(message) => {
             let output = repo.commit(&message)?;
             if !output.trim().is_empty() {
@@ -146,6 +261,141 @@ async fn run_commit(repo: &GitRepo) -> Result<()> {
     }
 }
 
+async fn build_ship_plan(
+    status: &crate::git::RepoStatus,
+    base_label: &str,
+    commits: &[crate::git::BranchCommit],
+    changed_files: &[String],
+    diff_stat: &str,
+    diff: &str,
+) -> Result<ShipPlan> {
+    let input = ShipPromptInput {
+        branch: status
+            .branch
+            .clone()
+            .unwrap_or_else(|| "DETACHED".to_string()),
+        base_label: base_label.to_string(),
+        staged_count: status.staged_count,
+        unstaged_count: status.unstaged_count,
+        local_commits: commits
+            .iter()
+            .map(|commit| ShipCommit {
+                subject: commit.subject.clone(),
+                body: commit.body.clone(),
+            })
+            .collect(),
+        changed_files: changed_files.to_vec(),
+        diff_stat: diff_stat.to_string(),
+        diff: diff.to_string(),
+    };
+    let settings = resolve_non_secret_settings()?;
+
+    match settings.generation_mode.value {
+        GenerationMode::HeuristicOnly => Ok(build_heuristic_ship_plan(&input)),
+        GenerationMode::Auto | GenerationMode::AiOnly => {
+            let config = AiConfig::load()?;
+            let client = AiClient::new(config)?;
+            client.generate_ship_plan(&input).await
+        }
+    }
+}
+
+fn has_cleanup_suggestions(plan: &ShipPlan) -> bool {
+    !(plan.commit_cleanup.is_empty()
+        && plan.split_suggestions.is_empty()
+        && plan.squash_suggestions.is_empty())
+}
+
+fn print_ship_plan(
+    status: &crate::git::RepoStatus,
+    plan: &PushPlan,
+    base_label: &str,
+    ship_plan: &ShipPlan,
+) {
+    println!("Ship preflight:");
+    println!(
+        "- branch: {}",
+        status.branch.as_deref().unwrap_or("DETACHED")
+    );
+    println!("- compare against: {base_label}");
+    println!(
+        "- push target: {}",
+        match plan {
+            PushPlan::Upstream { branch } => format!("upstream for {branch}"),
+            PushPlan::SetUpstream { remote, branch } => format!("{remote}/{branch}"),
+        }
+    );
+    if let Some(note) = &ship_plan.note {
+        println!("- note: {note}");
+    }
+    print_ship_section("Checks", &ship_plan.preflight_checks);
+    print_ship_section("Commit Cleanup", &ship_plan.commit_cleanup);
+    print_ship_section("Split Suggestions", &ship_plan.split_suggestions);
+    print_ship_section("Squash Suggestions", &ship_plan.squash_suggestions);
+    println!("PR draft:");
+    println!("- title: {}", ship_plan.pr_title);
+    println!("{}", ship_plan.pr_body);
+}
+
+fn print_ship_section(title: &str, items: &[String]) {
+    if items.is_empty() {
+        return;
+    }
+
+    println!("{title}:");
+    for item in items {
+        println!("- {item}");
+    }
+}
+
+fn run_push(repo: &GitRepo) -> Result<()> {
+    repo.ensure_git_available()?;
+    repo.ensure_repo()?;
+
+    let plan = repo.plan_push().or_else(|error| {
+        tui::show_message("Cannot Push", &error.to_string())?;
+        Err(error)
+    })?;
+    let warnings = repo.push_diff_warnings(&plan)?;
+    if !warnings.is_empty() && !tui::confirm_unsafe_diff_warnings("pushing", &warnings)? {
+        println!("push cancelled");
+        return Ok(());
+    }
+
+    execute_push_plan(repo, &plan)
+}
+
+fn execute_push_plan(repo: &GitRepo, plan: &PushPlan) -> Result<()> {
+    match repo.push(plan) {
+        Ok(output) => {
+            if !output.trim().is_empty() {
+                println!("{output}");
+            } else {
+                println!("push completed");
+            }
+            Ok(())
+        }
+        Err(error) => {
+            let rendered = error.to_string();
+            if !push_needs_force_with_lease(&rendered) {
+                return Err(error);
+            }
+
+            if !tui::confirm_force_push(plan, &rendered)? {
+                println!("push cancelled");
+                return Ok(());
+            }
+
+            let output = repo.push_with_force_lease(plan)?;
+            if !output.trim().is_empty() {
+                println!("{output}");
+            } else {
+                println!("push completed with --force-with-lease");
+            }
+            Ok(())
+        }
+    }
+}
 async fn run_explain(repo: &GitRepo) -> Result<()> {
     repo.ensure_git_available()?;
     repo.ensure_repo()?;
@@ -173,51 +423,6 @@ async fn run_explain(repo: &GitRepo) -> Result<()> {
 
     print_diff_explanation(&explanation);
     Ok(())
-}
-
-fn run_push(repo: &GitRepo) -> Result<()> {
-    repo.ensure_git_available()?;
-    repo.ensure_repo()?;
-
-    let plan = repo.plan_push().or_else(|error| {
-        tui::show_message("Cannot Push", &error.to_string())?;
-        Err(error)
-    })?;
-    let warnings = repo.push_diff_warnings(&plan)?;
-    if !warnings.is_empty() && !tui::confirm_unsafe_diff_warnings("pushing", &warnings)? {
-        println!("push cancelled");
-        return Ok(());
-    }
-
-    match repo.push(&plan) {
-        Ok(output) => {
-            if !output.trim().is_empty() {
-                println!("{output}");
-            } else {
-                println!("push completed");
-            }
-            Ok(())
-        }
-        Err(error) => {
-            let rendered = error.to_string();
-            if !push_needs_force_with_lease(&rendered) {
-                return Err(error);
-            }
-
-            if !tui::confirm_force_push(&plan, &rendered)? {
-                println!("push cancelled");
-                return Ok(());
-            }
-
-            let output = repo.push_with_force_lease(&plan)?;
-            if !output.trim().is_empty() {
-                println!("{output}");
-            } else {
-                println!("push completed with --force-with-lease");
-            }
-            Ok(())
-        }
-    }
 }
 
 fn print_diff_explanation(explanation: &DiffExplanation) {

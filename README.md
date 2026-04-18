@@ -47,6 +47,7 @@ gg doctor
 Typical usage:
 
 ```bash
+gg ship
 gg commit
 gg explain
 gg push
@@ -68,6 +69,7 @@ cargo run --bin gg -- commit
 |---------|-------------|
 | `gg` | Open the home TUI with branch, staged/unstaged counts, and remote status |
 | `gg commit` | Generate commit options from staged changes and commit after confirmation |
+| `gg ship` | Run one ship flow: preflight, commit cleanup suggestions, PR draft generation, push, and optional PR creation |
 | `gg explain` | Explain the staged diff in four sections |
 | `gg push` | Push the current branch and offer `--force-with-lease` only after confirmation |
 | `gg ask <query>` | Turn a natural language Git request into exact command(s) with risk guidance |
@@ -210,9 +212,11 @@ gg config unset conventional-preset
 
 - `gg commit` and `gg explain` only use staged changes
 - `gg commit` warns about risky staged diffs, supports inline editing, and can propose split commits for mixed concerns
+- `gg ship` can roll staged work into the existing commit flow first, surfaces split/squash cleanup suggestions for the outgoing branch, drafts a PR title/body, pushes, and can open a PR through `gh`
 - `gg ask` returns recommended and alternative commands with risk badges and explanations
 - dangerous actions suggested by `gg ask` require extra confirmation before execution
 - `gg push` warns about risky outgoing diffs and does not guess across ambiguous remotes
+- `gg ship` only creates a PR when both a GitHub remote and the GitHub CLI (`gh`) are available
 - `gitgud` shells out to the system `git`, so hooks, credentials, and normal Git config still apply
 - detached HEAD is rejected for commit and push flows
 
