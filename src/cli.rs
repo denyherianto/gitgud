@@ -8,7 +8,8 @@ use crate::rescue::RescueIncident;
 #[derive(Debug, Parser)]
 #[command(
     name = "gg",
-    about = "A Git CLI with AI-assisted commit, push, and setup flows"
+    about = "A Git CLI with AI-assisted commit, push, and setup flows",
+    version = env!("CARGO_PKG_VERSION")
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -17,6 +18,8 @@ pub struct Cli {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum Command {
+    /// Print the installed gitgud version
+    Version,
     /// Generate 1-3 commit message options for staged changes
     Commit,
     /// Preflight a branch, clean up commits, draft review text, and push
@@ -54,8 +57,40 @@ pub enum Command {
     },
     /// Rebuild repo-specific memory by scanning the last 50 commits
     Learn,
+    /// Query and manage commit-intelligence memory
+    Memory {
+        #[command(subcommand)]
+        command: MemoryCommand,
+    },
     #[command(external_subcommand)]
     Passthrough(Vec<OsString>),
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum MemoryCommand {
+    /// Install or refresh the post-commit hook for this repository
+    Install,
+    /// Backfill commit intelligence for recent history
+    Learn,
+    /// Explain a commit using stored Git memory
+    Explain {
+        #[arg(default_value = "HEAD")]
+        commit: String,
+    },
+    /// Search commit intelligence by feature, intent, file, or commit text
+    Search {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        query: Vec<String>,
+    },
+    /// Show related features and commits for a file
+    Impact { file: String },
+    /// Report likely stale files from commit-memory history
+    Stale,
+    #[command(hide = true)]
+    Ingest {
+        #[arg(long, default_value = "HEAD")]
+        commit: String,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -127,7 +162,7 @@ impl From<CommitStyleArg> for CommitStyle {
 mod tests {
     use clap::Parser;
 
-    use super::{Cli, Command};
+    use super::{Cli, Command, MemoryCommand};
 
     #[test]
     fn parses_unknown_subcommand_as_git_passthrough() {
@@ -168,6 +203,16 @@ mod tests {
     }
 
     #[test]
+    fn parses_version_command() {
+        let cli = Cli::try_parse_from(["gg", "version"]).unwrap();
+
+        match cli.command {
+            Some(Command::Version) => {}
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
     fn parses_ship_command() {
         let cli = Cli::try_parse_from(["gg", "ship"]).unwrap();
 
@@ -184,6 +229,20 @@ mod tests {
         match cli.command {
             Some(Command::Rescue { incident }) => {
                 assert!(incident.is_some());
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_memory_explain_command() {
+        let cli = Cli::try_parse_from(["gg", "memory", "explain", "HEAD~1"]).unwrap();
+
+        match cli.command {
+            Some(Command::Memory {
+                command: MemoryCommand::Explain { commit },
+            }) => {
+                assert_eq!(commit, "HEAD~1");
             }
             other => panic!("unexpected command: {other:?}"),
         }

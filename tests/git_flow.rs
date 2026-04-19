@@ -128,6 +128,8 @@ fn heuristic_fallback_ignores_unstaged_changes() {
         diff: staged.diff,
         commit_style: CommitStyle::Standard,
         conventional_preset: ResolvedConventionalPreset::built_in_default(),
+        repo_memory: None,
+        git_memory_context: Vec::new(),
     });
 
     assert_eq!(options[0], "Improve main");
@@ -361,7 +363,7 @@ fn warns_for_outgoing_lockfile_only_pushes() {
 
     let repo = GitRepo::new(repo_dir.path());
     let plan = repo.plan_push().unwrap();
-    let warnings = warning_messages(repo.push_diff_warnings(&plan).unwrap());
+    let warnings = warning_messages(repo.push_diff_warnings(&plan, None).unwrap());
 
     assert!(
         warnings

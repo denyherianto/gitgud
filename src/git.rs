@@ -40,6 +40,17 @@ pub struct BranchCommit {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitDetails {
+    pub sha: String,
+    pub subject: String,
+    pub body: String,
+    pub committed_at: i64,
+    pub changed_files: Vec<String>,
+    pub diff_stat: String,
+    pub diff: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShipRange {
     pub base_label: String,
     pub commits: Vec<BranchCommit>,
@@ -337,6 +348,63 @@ impl GitRepo {
     pub fn head_sha(&self) -> Result<String> {
         self.run_checked(["rev-parse", "HEAD"])
             .map(|output| output.trim().to_string())
+    }
+
+    pub fn commit_details(&self, reference: &str) -> Result<CommitDetails> {
+        let sha = self.resolve_ref(reference)?;
+        let header = self.run_checked_slice(&[
+            "show",
+            "-s",
+            "--format=%H%x1f%s%x1f%b%x1f%ct",
+            sha.as_str(),
+        ])?;
+        let mut fields = header.trim_end().split('\u{1f}');
+        let resolved_sha = fields
+            .next()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("git show did not return a commit sha"))?
+            .to_string();
+        let subject = fields.next().unwrap_or_default().trim().to_string();
+        let body = fields.next().unwrap_or_default().trim().to_string();
+        let committed_at = fields
+            .next()
+            .unwrap_or("0")
+            .trim()
+            .parse::<i64>()
+            .unwrap_or(0);
+
+        let changed_files = self
+            .run_checked_slice(&["show", "--name-only", "--format=", sha.as_str()])?
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let diff_stat = self.run_checked_slice(&[
+            "show",
+            "--stat",
+            "--compact-summary",
+            "--format=",
+            sha.as_str(),
+        ])?;
+        let diff = self.run_checked_slice(&[
+            "show",
+            "--patch",
+            "--no-ext-diff",
+            "--format=",
+            sha.as_str(),
+        ])?;
+
+        Ok(CommitDetails {
+            sha: resolved_sha,
+            subject,
+            body,
+            committed_at,
+            changed_files,
+            diff_stat,
+            diff,
+        })
     }
 
     pub fn git_dir(&self) -> Result<PathBuf> {

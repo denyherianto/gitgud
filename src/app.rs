@@ -9,7 +9,7 @@ use crate::{
         AiClient, AiConfig, AskContext, DiffExplanation, PromptInput, ShipCommit, ShipPlan,
         ShipPromptInput, SuggestedCommand, build_heuristic_ship_plan,
     },
-    cli::{AuthCommand, Cli, Command, ConfigCommand},
+    cli::{AuthCommand, Cli, Command, ConfigCommand, MemoryCommand},
     config::{
         GenerationMode, TokenStatus, config_path, delete_api_token, load_api_token, load_file,
         resolve_ai_settings, resolve_non_secret_settings, save_file_to_path, set_config_value,
@@ -42,6 +42,10 @@ pub async fn run() -> Result<()> {
     };
 
     match command {
+        Command::Version => {
+            println!("gg {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
         Command::Commit => run_commit(&repo).await,
         Command::Ship => run_ship(&repo).await,
         Command::Explain => run_explain(&repo).await,
@@ -65,10 +69,11 @@ pub async fn run() -> Result<()> {
                 run_git_passthrough(&repo, &args)
             }
         }
-        Command::Config { command } => run_config(command),
+        Command::Config { command } => run_config(&repo, command),
         Command::Auth { command } => run_auth(command),
         Command::Doctor => run_doctor(&repo).await,
-        Command::Learn => run_learn(&repo),
+        Command::Learn => run_learn(&repo).await,
+        Command::Memory { command } => run_memory(&repo, command).await,
     }
 }
 
@@ -91,6 +96,7 @@ async fn run_commit(repo: &GitRepo) -> Result<()> {
     repo.ensure_repo()?;
 
     let memory = crate::memory::load_or_build(repo);
+    let git_memory_context = crate::git_memory::cached_recent_context(repo, 5).unwrap_or_default();
     let status = repo.status()?;
     if status.staged_count == 0 {
         if status.unstaged_count > 0 {
@@ -133,6 +139,7 @@ async fn run_commit(repo: &GitRepo) -> Result<()> {
             settings.generation_mode.value,
             settings.conventional_preset.value,
             memory,
+            git_memory_context,
         )
         .await?,
     )
@@ -185,6 +192,7 @@ async fn run_ship(repo: &GitRepo) -> Result<()> {
     }
 
     let ship_plan = build_ship_plan(
+        repo,
         &status,
         &ship_range.base_label,
         &ship_range.commits,
@@ -257,6 +265,7 @@ fn execute_commit_action(repo: &GitRepo, action: CommitAction) -> Result<()> {
 }
 
 async fn build_ship_plan(
+    repo: &GitRepo,
     status: &crate::git::RepoStatus,
     base_label: &str,
     commits: &[crate::git::BranchCommit],
@@ -265,6 +274,13 @@ async fn build_ship_plan(
     diff: &str,
     memory: Option<crate::memory::RepoMemory>,
 ) -> Result<ShipPlan> {
+    let refs = commits
+        .iter()
+        .map(|commit| commit.sha.clone())
+        .collect::<Vec<_>>();
+    let git_memory_context = crate::git_memory::context_for_refs(repo, &refs, 5)
+        .await
+        .unwrap_or_default();
     let input = ShipPromptInput {
         branch: status
             .branch
@@ -284,17 +300,27 @@ async fn build_ship_plan(
         diff_stat: diff_stat.to_string(),
         diff: diff.to_string(),
         repo_memory: memory,
+        git_memory_context,
     };
     let settings = resolve_non_secret_settings()?;
 
-    match settings.generation_mode.value {
+    let mut plan = match settings.generation_mode.value {
         GenerationMode::HeuristicOnly => Ok(build_heuristic_ship_plan(&input)),
         GenerationMode::Auto | GenerationMode::AiOnly => {
             let config = AiConfig::load()?;
             let client = AiClient::new(config)?;
             client.generate_ship_plan(&input).await
         }
+    }?;
+
+    if !input.git_memory_context.is_empty() {
+        plan.note = Some(format!(
+            "Git memory: {}",
+            input.git_memory_context.join(" | ")
+        ));
     }
+
+    Ok(plan)
 }
 
 fn has_cleanup_suggestions(plan: &ShipPlan) -> bool {
@@ -561,6 +587,7 @@ async fn run_explain(repo: &GitRepo) -> Result<()> {
         commit_style: config.commit_style,
         conventional_preset: config.conventional_preset.clone(),
         repo_memory: memory,
+        git_memory_context: Vec::new(),
     };
     let client = AiClient::new(config)?;
     let explanation = client.generate_diff_explanation(&input).await?;
@@ -600,9 +627,9 @@ fn run_git_passthrough(repo: &GitRepo, args: &[OsString]) -> Result<()> {
     }
 }
 
-fn run_config(command: Option<ConfigCommand>) -> Result<()> {
+fn run_config(repo: &GitRepo, command: Option<ConfigCommand>) -> Result<()> {
     match command {
-        None | Some(ConfigCommand::Setup) => run_config_setup(),
+        None | Some(ConfigCommand::Setup) => run_config_setup(repo),
         Some(ConfigCommand::Show) => {
             let path = config_path()?;
             let stored = load_file()?;
@@ -701,7 +728,7 @@ fn run_config(command: Option<ConfigCommand>) -> Result<()> {
     }
 }
 
-fn run_config_setup() -> Result<()> {
+fn run_config_setup(repo: &GitRepo) -> Result<()> {
     let path = config_path()?;
     let resolved = resolve_non_secret_settings()?;
     let current_token_status = token_status()?;
@@ -752,6 +779,25 @@ fn run_config_setup() -> Result<()> {
     }
 
     println!("Updated configuration in {}", path.display());
+    if repo.ensure_repo().is_ok() {
+        match crate::git_memory::install_post_commit_hook(repo)? {
+            crate::git_memory::HookInstallStatus::Installed(path) => {
+                println!("Installed Git memory hook at {}", path.display());
+            }
+            crate::git_memory::HookInstallStatus::Updated(path) => {
+                println!("Updated Git memory hook at {}", path.display());
+            }
+            crate::git_memory::HookInstallStatus::AlreadyInstalled(path) => {
+                println!("Git memory hook already installed at {}", path.display());
+            }
+            crate::git_memory::HookInstallStatus::Conflict(path) => {
+                println!(
+                    "Skipped Git memory hook install because {} is managed by another script",
+                    path.display()
+                );
+            }
+        }
+    }
     Ok(())
 }
 
@@ -898,12 +944,13 @@ async fn run_doctor(repo: &GitRepo) -> Result<()> {
     Ok(())
 }
 
-fn run_learn(repo: &GitRepo) -> Result<()> {
+async fn run_learn(repo: &GitRepo) -> Result<()> {
     repo.ensure_git_available()?;
     repo.ensure_repo()?;
 
     println!("Scanning the last 50 commits...");
     let memory = crate::memory::force_build(repo)?;
+    let git_memory = crate::git_memory::backfill_recent(repo, 50, false).await?;
 
     println!("Repo memory updated.");
     println!("  Commit style hint : {}", memory.commit_style_hint);
@@ -929,7 +976,135 @@ fn run_learn(repo: &GitRepo) -> Result<()> {
     let root = repo.repo_root()?;
     let path = crate::memory::memory_path(&root)?;
     println!("  Saved to          : {}", path.display());
+    println!(
+        "  Git memory        : {} analyzed, {} already indexed",
+        git_memory.analyzed, git_memory.skipped
+    );
     Ok(())
+}
+
+async fn run_memory(repo: &GitRepo, command: MemoryCommand) -> Result<()> {
+    repo.ensure_git_available()?;
+    repo.ensure_repo()?;
+
+    match command {
+        MemoryCommand::Install => match crate::git_memory::install_post_commit_hook(repo)? {
+            crate::git_memory::HookInstallStatus::Installed(path) => {
+                println!("Installed post-commit hook at {}", path.display());
+            }
+            crate::git_memory::HookInstallStatus::Updated(path) => {
+                println!("Updated post-commit hook at {}", path.display());
+            }
+            crate::git_memory::HookInstallStatus::AlreadyInstalled(path) => {
+                println!("Post-commit hook already installed at {}", path.display());
+            }
+            crate::git_memory::HookInstallStatus::Conflict(path) => {
+                bail!(
+                    "cannot install Git memory hook because {} is already managed by another script",
+                    path.display()
+                );
+            }
+        },
+        MemoryCommand::Learn => {
+            let summary = crate::git_memory::backfill_recent(repo, 50, false).await?;
+            println!(
+                "Indexed {} commit(s); {} already had Git memory.",
+                summary.analyzed, summary.skipped
+            );
+        }
+        MemoryCommand::Explain { commit } => {
+            let record = crate::git_memory::explain_commit(repo, &commit).await?;
+            print_commit_memory_record(&record);
+        }
+        MemoryCommand::Search { query } => {
+            let query = query.join(" ").trim().to_string();
+            if query.is_empty() {
+                println!("Usage: gg memory search <query>");
+                return Ok(());
+            }
+            let results = crate::git_memory::search(repo, &query).await?;
+            if results.is_empty() {
+                println!("No Git memory matches found for `{query}`.");
+            } else {
+                println!("Git memory matches for `{query}`:");
+                for result in results {
+                    println!(
+                        "- {} {} [{}]",
+                        result.sha.chars().take(7).collect::<String>(),
+                        result.subject,
+                        result.feature
+                    );
+                    println!("  what: {}", result.what_changed);
+                    println!("  why: {}", result.why);
+                    if !result.related_files.is_empty() {
+                        println!("  files: {}", result.related_files.join(", "));
+                    }
+                }
+            }
+        }
+        MemoryCommand::Impact { file } => match crate::git_memory::impact(repo, &file).await? {
+            Some(report) => {
+                println!("Impact for {}:", report.file);
+                if !report.features.is_empty() {
+                    println!("Features: {}", report.features.join(", "));
+                }
+                for commit in report.commits {
+                    println!(
+                        "- {} {} [{}]",
+                        commit.sha.chars().take(7).collect::<String>(),
+                        commit.subject,
+                        commit.feature
+                    );
+                    println!("  what: {}", commit.what_changed);
+                    println!("  why: {}", commit.why);
+                }
+            }
+            None => {
+                println!("No Git memory found for {}.", file);
+            }
+        },
+        MemoryCommand::Stale => {
+            let candidates = crate::git_memory::stale(repo).await?;
+            if candidates.is_empty() {
+                println!("No likely stale files found from the indexed commit history.");
+            } else {
+                println!("Likely stale files:");
+                for candidate in candidates {
+                    println!(
+                        "- {} [{}] last touched by {} ({})",
+                        candidate.file,
+                        candidate.feature,
+                        candidate.last_touch_sha.chars().take(7).collect::<String>(),
+                        candidate.last_touch_subject
+                    );
+                    println!("  {}", candidate.reason);
+                }
+            }
+        }
+        MemoryCommand::Ingest { commit } => {
+            let _ = crate::git_memory::ingest_commit(repo, &commit).await?;
+        }
+    }
+
+    Ok(())
+}
+
+fn print_commit_memory_record(record: &crate::git_memory::CommitMemoryRecord) {
+    println!("Commit: {}", record.sha);
+    println!("Subject: {}", record.subject);
+    println!("Feature: {}", record.feature);
+    println!("What Changed:");
+    for item in &record.what_changed {
+        println!("- {item}");
+    }
+    println!("Why:");
+    for item in &record.why {
+        println!("- {item}");
+    }
+    println!("Related Files:");
+    for file in &record.related_files {
+        println!("- {file}");
+    }
 }
 
 async fn run_ask_command(repo: &GitRepo, query: &str) -> Result<()> {

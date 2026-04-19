@@ -89,6 +89,7 @@ pub struct PromptInput {
     pub commit_style: CommitStyle,
     pub conventional_preset: ResolvedConventionalPreset,
     pub repo_memory: Option<crate::memory::RepoMemory>,
+    pub git_memory_context: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,6 +153,25 @@ pub struct ShipPromptInput {
     pub diff_stat: String,
     pub diff: String,
     pub repo_memory: Option<crate::memory::RepoMemory>,
+    pub git_memory_context: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CommitMemoryPromptInput {
+    pub sha: String,
+    pub subject: String,
+    pub body: String,
+    pub changed_files: Vec<String>,
+    pub diff_stat: String,
+    pub diff: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitMemoryAnalysis {
+    pub what_changed: Vec<String>,
+    pub why: Vec<String>,
+    pub feature: String,
+    pub related_files: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -245,6 +265,20 @@ impl AiClient {
             .await?;
 
         parse_diff_explanation(&content)
+    }
+
+    pub async fn generate_commit_memory(
+        &self,
+        input: &CommitMemoryPromptInput,
+    ) -> Result<CommitMemoryAnalysis> {
+        let content = self
+            .request_chat_completion(
+                build_commit_memory_system_prompt(),
+                build_commit_memory_prompt(input),
+            )
+            .await?;
+
+        parse_commit_memory_analysis(&content, &input.changed_files)
     }
 
     pub async fn generate_ask_suggestion(
@@ -467,15 +501,17 @@ pub fn build_commit_prompt(input: &PromptInput) -> String {
         .as_ref()
         .map(build_repo_memory_block)
         .unwrap_or_default();
+    let git_memory_block = build_git_memory_context_block(&input.git_memory_context);
     format!(
-        "Commit style: {}{}\n{}{}",
+        "Commit style: {}{}\n{}{}{}",
         match input.commit_style {
             CommitStyle::Standard => "standard",
             CommitStyle::Conventional => "conventional",
         },
         build_conventional_context(input),
         build_diff_context(input, DEFAULT_MAX_DIFF_CHARS),
-        memory_block
+        memory_block,
+        git_memory_block
     )
 }
 
@@ -483,6 +519,32 @@ pub fn build_diff_explanation_prompt(input: &PromptInput) -> String {
     format!(
         "Explain this staged diff in four sections: what changed, possible intent, risk areas, and test suggestions.\n{}",
         build_diff_context(input, DEFAULT_MAX_DIFF_CHARS)
+    )
+}
+
+pub fn build_commit_memory_prompt(input: &CommitMemoryPromptInput) -> String {
+    let file_list = if input.changed_files.is_empty() {
+        "(none)".to_string()
+    } else {
+        input.changed_files.join(", ")
+    };
+
+    format!(
+        "Commit: {}\nSubject: {}\nBody:\n{}\nChanged files: {}\nDiff summary:\n{}\n\nPatch:\n{}",
+        input.sha,
+        input.subject,
+        if input.body.trim().is_empty() {
+            "(no body)"
+        } else {
+            input.body.trim()
+        },
+        file_list,
+        if input.diff_stat.trim().is_empty() {
+            "(no diff summary)"
+        } else {
+            input.diff_stat.trim()
+        },
+        truncate_diff(&input.diff, DEFAULT_MAX_DIFF_CHARS)
     )
 }
 
@@ -503,6 +565,21 @@ fn build_diff_context(input: &PromptInput, max_diff_chars: usize) -> String {
             input.diff_stat.trim()
         },
         truncate_diff(&input.diff, max_diff_chars)
+    )
+}
+
+fn build_git_memory_context_block(lines: &[String]) -> String {
+    if lines.is_empty() {
+        return String::new();
+    }
+
+    format!(
+        "\n\nRecent Git memory:\n{}",
+        lines
+            .iter()
+            .map(|line| format!("- {line}"))
+            .collect::<Vec<_>>()
+            .join("\n")
     )
 }
 
@@ -747,6 +824,10 @@ fn build_diff_explanation_system_prompt() -> String {
     "You explain staged Git diffs for engineers. Return valid JSON only with this shape: {\"what_changed\":[\"item 1\"],\"possible_intent\":[\"item 1\"],\"risk_areas\":[\"item 1\"],\"test_suggestions\":[\"item 1\"]}. Each field must be an array of 1 to 4 concise strings. Base `what_changed`, `risk_areas`, and `test_suggestions` on the diff only. `possible_intent` may be an inference from the diff. Do not use markdown fences, headings, numbering, or extra commentary.".to_string()
 }
 
+fn build_commit_memory_system_prompt() -> String {
+    r#"You analyze Git commits and turn them into searchable engineering memory. Return valid JSON only with this exact shape: {"what_changed":["item 1"],"why":["item 1"],"feature":"feature name","related_files":["path/a.rs"]}. `what_changed` must contain 1 to 4 concise observations grounded in the commit. `why` must contain 1 to 3 likely motivations or outcomes and may be an inference from the diff and commit message. `feature` must be a short stable label that groups related commits. `related_files` must be 1 to 8 files chosen only from the provided changed file list. Do not use markdown fences, headings, numbering, or commentary."#.to_string()
+}
+
 fn build_ask_system_prompt() -> String {
     r#"You are a Git command assistant. Given a natural language description, suggest the exact git command(s). Return valid JSON with this shape: {"recommended":[{"command":"git ...","description":"..."}],"alternative":[{"command":"git ...","description":"..."}],"explanation":"...","teaching_note":"..."}. `recommended` is 1-4 commands in execution order. `alternative` is optional — use null if there is no meaningful alternative. Every `command` must start with "git ". `explanation` gives context on the recommended approach. `teaching_note` explains the underlying Git concept. No markdown fences."#.to_string()
 }
@@ -801,8 +882,9 @@ fn build_ship_user_prompt(input: &ShipPromptInput) -> String {
         .as_ref()
         .map(build_repo_memory_block)
         .unwrap_or_default();
+    let git_memory_block = build_git_memory_context_block(&input.git_memory_context);
     format!(
-        "Branch: {}\nBase branch: {}\nStaged files: {}\nUnstaged files: {}\nChanged files: {}\n\nLocal commits:\n{}\n\nOutgoing diff stat:\n{}\n\nOutgoing diff:\n{}{}",
+        "Branch: {}\nBase branch: {}\nStaged files: {}\nUnstaged files: {}\nChanged files: {}\n\nLocal commits:\n{}\n\nOutgoing diff stat:\n{}\n\nOutgoing diff:\n{}{}{}",
         input.branch,
         input.base_label,
         input.staged_count,
@@ -811,7 +893,8 @@ fn build_ship_user_prompt(input: &ShipPromptInput) -> String {
         commits,
         input.diff_stat,
         truncate_diff(&input.diff, DEFAULT_MAX_DIFF_CHARS),
-        memory_block
+        memory_block,
+        git_memory_block
     )
 }
 
@@ -910,6 +993,7 @@ fn parse_commit_suggestions(raw: &str, commit_style: CommitStyle) -> Result<Comm
         commit_style,
         conventional_preset: ResolvedConventionalPreset::built_in_default(),
         repo_memory: None,
+        git_memory_context: Vec::new(),
     };
 
     parse_commit_suggestions_with_preset(
@@ -940,17 +1024,40 @@ fn parse_commit_suggestions_with_preset(
         )?);
     }
 
-    if !parsed.split.is_empty() && !(2..=4).contains(&parsed.split.len()) {
-        bail!("AI provider split suggestions must contain between 2 and 4 messages");
-    }
-
-    let split = resolve_split_plans(parsed.split, input, commit_style, conventional_preset)?;
+    let (split, note) =
+        resolve_split_plans_with_fallback(parsed.split, input, commit_style, conventional_preset)?;
 
     Ok(CommitSuggestions {
         options,
         split,
-        note: None,
+        note,
     })
+}
+
+fn resolve_split_plans_with_fallback(
+    split: Vec<SplitPlanPayload>,
+    input: &PromptInput,
+    commit_style: CommitStyle,
+    conventional_preset: &ResolvedConventionalPreset,
+) -> Result<(Vec<SplitCommitPlan>, Option<String>)> {
+    if split.is_empty() {
+        return Ok((Vec::new(), None));
+    }
+
+    if !(2..=4).contains(&split.len()) {
+        return Ok((
+            build_heuristic_split_suggestions(input),
+            Some("AI split plan was invalid. Showing heuristic split suggestions.".to_string()),
+        ));
+    }
+
+    match resolve_split_plans(split, input, commit_style, conventional_preset) {
+        Ok(plans) => Ok((plans, None)),
+        Err(_) => Ok((
+            build_heuristic_split_suggestions(input),
+            Some("AI split plan was invalid. Showing heuristic split suggestions.".to_string()),
+        )),
+    }
 }
 
 fn parse_diff_explanation(raw: &str) -> Result<DiffExplanation> {
@@ -962,6 +1069,40 @@ fn parse_diff_explanation(raw: &str) -> Result<DiffExplanation> {
         possible_intent: normalize_explanation_items(parsed.possible_intent, "possible_intent")?,
         risk_areas: normalize_explanation_items(parsed.risk_areas, "risk_areas")?,
         test_suggestions: normalize_explanation_items(parsed.test_suggestions, "test_suggestions")?,
+    })
+}
+
+fn parse_commit_memory_analysis(
+    raw: &str,
+    changed_files: &[String],
+) -> Result<CommitMemoryAnalysis> {
+    let json = raw.trim();
+    let parsed: CommitMemoryPayload = if let Ok(payload) = serde_json::from_str(json) {
+        payload
+    } else if let Some(stripped) = strip_code_fence(json) {
+        serde_json::from_str(stripped).context("failed to parse commit memory JSON")?
+    } else {
+        bail!("failed to parse commit memory JSON");
+    };
+
+    let mut related_files = parsed
+        .related_files
+        .into_iter()
+        .map(|file| file.trim().to_string())
+        .filter(|file| !file.is_empty())
+        .filter(|file| changed_files.iter().any(|changed| changed == file))
+        .collect::<Vec<_>>();
+    related_files.sort();
+    related_files.dedup();
+    if related_files.is_empty() {
+        related_files = changed_files.to_vec();
+    }
+
+    Ok(CommitMemoryAnalysis {
+        what_changed: normalize_explanation_items(parsed.what_changed, "what_changed")?,
+        why: normalize_explanation_items(parsed.why, "why")?,
+        feature: parsed.feature.trim().to_string(),
+        related_files,
     })
 }
 
@@ -983,6 +1124,24 @@ fn normalize_explanation_items(items: Vec<String>, field: &str) -> Result<Vec<St
     Ok(normalized)
 }
 
+pub fn build_heuristic_commit_memory(input: &CommitMemoryPromptInput) -> CommitMemoryAnalysis {
+    let feature = infer_commit_memory_feature(&input.changed_files, &input.subject);
+    let what_changed = vec![sentence_case(&describe_change_subject(
+        &input.changed_files,
+    ))];
+    let why = vec![format!(
+        "Likely intended to {}",
+        subject_to_inferred_intent(&input.subject)
+    )];
+
+    CommitMemoryAnalysis {
+        what_changed,
+        why,
+        feature,
+        related_files: input.changed_files.clone(),
+    }
+}
+
 #[cfg(test)]
 fn parse_commit_options(raw: &str, commit_style: CommitStyle) -> Result<Vec<String>> {
     parse_commit_suggestions_with_preset(
@@ -995,6 +1154,7 @@ fn parse_commit_options(raw: &str, commit_style: CommitStyle) -> Result<Vec<Stri
             commit_style,
             conventional_preset: ResolvedConventionalPreset::built_in_default(),
             repo_memory: None,
+            git_memory_context: Vec::new(),
         },
         commit_style,
         &ResolvedConventionalPreset::built_in_default(),
@@ -1162,6 +1322,7 @@ fn fallback_pr_title(input: &ShipPromptInput) -> String {
         commit_style: CommitStyle::Standard,
         conventional_preset: ResolvedConventionalPreset::built_in_default(),
         repo_memory: None,
+        git_memory_context: Vec::new(),
     };
     let fallback = build_heuristic_commit_options(&summary_input)
         .into_iter()
@@ -1886,6 +2047,33 @@ fn infer_conventional_scope(staged_files: &[String]) -> String {
     "project".to_string()
 }
 
+fn infer_commit_memory_feature(changed_files: &[String], subject: &str) -> String {
+    let stripped = strip_conventional_prefix(subject);
+    let trimmed = stripped.trim();
+    if !trimmed.is_empty() {
+        let first_word = trimmed
+            .split_whitespace()
+            .take(3)
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !first_word.is_empty() {
+            return first_word.to_ascii_lowercase();
+        }
+    }
+
+    humanize_identifier(&infer_conventional_scope(changed_files))
+}
+
+fn subject_to_inferred_intent(subject: &str) -> String {
+    let stripped_value = strip_conventional_prefix(subject);
+    let stripped = stripped_value.trim();
+    if stripped.is_empty() {
+        "improve the project".to_string()
+    } else {
+        stripped.to_ascii_lowercase()
+    }
+}
+
 fn humanize_identifier(raw: &str) -> String {
     raw.split(|ch: char| !ch.is_ascii_alphanumeric())
         .filter(|segment| !segment.is_empty())
@@ -1987,6 +2175,14 @@ struct DiffExplanationPayload {
     possible_intent: Vec<String>,
     risk_areas: Vec<String>,
     test_suggestions: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CommitMemoryPayload {
+    what_changed: Vec<String>,
+    why: Vec<String>,
+    feature: String,
+    related_files: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2146,6 +2342,7 @@ mod tests {
             commit_style: CommitStyle::Standard,
             conventional_preset: default_preset(),
             repo_memory: None,
+            git_memory_context: Vec::new(),
         });
 
         assert!(prompt.contains("Branch: main"));
@@ -2164,6 +2361,7 @@ mod tests {
             commit_style: CommitStyle::Conventional,
             conventional_preset: default_preset(),
             repo_memory: None,
+            git_memory_context: Vec::new(),
         });
 
         assert!(prompt.contains("Conventional preset: default"));
@@ -2180,6 +2378,7 @@ mod tests {
             commit_style: CommitStyle::Standard,
             conventional_preset: default_preset(),
             repo_memory: None,
+            git_memory_context: Vec::new(),
         });
 
         assert!(prompt.contains("what changed"));
@@ -2317,6 +2516,7 @@ mod tests {
             commit_style: CommitStyle::Conventional,
             conventional_preset: default_preset(),
             repo_memory: None,
+            git_memory_context: Vec::new(),
         };
         let preset = default_preset();
         let suggestions = parse_commit_suggestions_with_preset(
@@ -2337,14 +2537,56 @@ mod tests {
     }
 
     #[test]
-    fn rejects_split_commit_suggestions_with_invalid_count() {
-        let error = parse_commit_suggestions(
+    fn falls_back_when_split_commit_suggestions_have_invalid_count() {
+        let suggestions = parse_commit_suggestions(
             r#"{"options":["Update billing flow"],"split":["Add billing summary card"]}"#,
             CommitStyle::Standard,
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(error.to_string().contains("between 2 and 4"));
+        assert_eq!(suggestions.options, vec!["Update billing flow".to_string()]);
+        assert_eq!(suggestions.split.len(), 2);
+        assert_eq!(
+            suggestions.note,
+            Some("AI split plan was invalid. Showing heuristic split suggestions.".to_string())
+        );
+    }
+
+    #[test]
+    fn falls_back_when_provider_split_reuses_a_file() {
+        let input = super::PromptInput {
+            branch: "feature/billing".into(),
+            staged_files: vec!["src/billing.rs".into(), "src/subscription.rs".into()],
+            diff_stat: "2 files changed".into(),
+            diff: "diff --git a/src/billing.rs b/src/billing.rs\n+fn billing_summary_card() {}\ndiff --git a/src/subscription.rs b/src/subscription.rs\n+if status == null {\n+    return;\n+}\n".into(),
+            commit_style: CommitStyle::Standard,
+            conventional_preset: default_preset(),
+            repo_memory: None,
+            git_memory_context: Vec::new(),
+        };
+
+        let suggestions = parse_commit_suggestions_with_preset(
+            r#"{"options":["Update billing flow"],"split":[{"message":"Add billing summary","files":["src/billing.rs"]},{"message":"Fix subscription status","files":["src/billing.rs","src/subscription.rs"]}]}"#,
+            &input,
+            CommitStyle::Standard,
+            &default_preset(),
+        )
+        .unwrap();
+
+        assert_eq!(suggestions.options, vec!["Update billing flow".to_string()]);
+        assert_eq!(suggestions.split.len(), 2);
+        assert_eq!(
+            suggestions.split[0].files,
+            vec!["src/billing.rs".to_string()]
+        );
+        assert_eq!(
+            suggestions.split[1].files,
+            vec!["src/subscription.rs".to_string()]
+        );
+        assert_eq!(
+            suggestions.note,
+            Some("AI split plan was invalid. Showing heuristic split suggestions.".to_string())
+        );
     }
 
     #[test]
@@ -2384,6 +2626,7 @@ mod tests {
             commit_style: CommitStyle::Standard,
             conventional_preset: default_preset(),
             repo_memory: None,
+            git_memory_context: Vec::new(),
         });
 
         assert_eq!(options[0], "Update release workflow");
@@ -2400,6 +2643,7 @@ mod tests {
             commit_style: CommitStyle::Standard,
             conventional_preset: default_preset(),
             repo_memory: None,
+            git_memory_context: Vec::new(),
         });
 
         assert_eq!(options[0], "Retry ai generation before fallback");
@@ -2417,6 +2661,7 @@ mod tests {
             commit_style: CommitStyle::Standard,
             conventional_preset: default_preset(),
             repo_memory: None,
+            git_memory_context: Vec::new(),
         });
 
         assert_eq!(options[0], "Improve fallback");
@@ -2434,6 +2679,7 @@ mod tests {
             commit_style: CommitStyle::Conventional,
             conventional_preset: default_preset(),
             repo_memory: None,
+            git_memory_context: Vec::new(),
         });
 
         assert!(options[0].starts_with("feat(tui): "));
@@ -2452,6 +2698,7 @@ mod tests {
             commit_style: CommitStyle::Conventional,
             conventional_preset: default_preset(),
             repo_memory: None,
+            git_memory_context: Vec::new(),
         });
 
         assert_eq!(suggestions.split.len(), 2);
@@ -2477,6 +2724,7 @@ mod tests {
             commit_style: CommitStyle::Standard,
             conventional_preset: default_preset(),
             repo_memory: None,
+            git_memory_context: Vec::new(),
         });
 
         assert_eq!(
@@ -2504,6 +2752,7 @@ mod tests {
             commit_style: CommitStyle::Conventional,
             conventional_preset: default_preset(),
             repo_memory: None,
+            git_memory_context: Vec::new(),
         });
 
         assert!(suggestions.split.is_empty());
@@ -2522,6 +2771,7 @@ mod tests {
                 types: vec!["bugfix".into(), "maintenance".into()],
             },
             repo_memory: None,
+            git_memory_context: Vec::new(),
         });
 
         assert!(suggestions.options[0].starts_with("bugfix(parser): "));
@@ -2620,6 +2870,7 @@ mod tests {
             diff_stat: "2 files changed".into(),
             diff: "diff --git a/src/app.rs b/src/app.rs\n+run ship".into(),
             repo_memory: None,
+            git_memory_context: Vec::new(),
         });
 
         assert!(prompt.contains("Branch: feature/ship"));
@@ -2653,6 +2904,7 @@ mod tests {
             diff_stat: "2 files changed".into(),
             diff: "diff --git a/src/app.rs b/src/app.rs\n+run ship".into(),
             repo_memory: None,
+            git_memory_context: Vec::new(),
         });
 
         assert!(!plan.commit_cleanup.is_empty());

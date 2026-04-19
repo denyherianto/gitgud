@@ -1,6 +1,9 @@
 use std::time::Duration;
 
-use gitgud::ai::{AiClient, AiConfig, DiffExplanation, PromptInput, fetch_model_options};
+use gitgud::ai::{
+    AiClient, AiConfig, CommitMemoryAnalysis, CommitMemoryPromptInput, DiffExplanation,
+    PromptInput, fetch_model_options,
+};
 use gitgud::config::{CommitStyle, GenerationMode, Provider, ResolvedConventionalPreset};
 use mockito::{Matcher, Server};
 
@@ -12,6 +15,8 @@ fn prompt() -> PromptInput {
         diff: "diff --git a/src/main.rs b/src/main.rs".into(),
         commit_style: CommitStyle::Standard,
         conventional_preset: ResolvedConventionalPreset::built_in_default(),
+        repo_memory: None,
+        git_memory_context: Vec::new(),
     }
 }
 
@@ -76,6 +81,8 @@ async fn surfaces_split_commit_suggestions_from_mock_server() {
             diff: "diff --git a/src/billing.rs b/src/billing.rs\n+fn billing_summary_card() {}\ndiff --git a/src/subscription.rs b/src/subscription.rs\n+if status == null {\n+    return;\n+}\n".into(),
             commit_style: CommitStyle::Conventional,
             conventional_preset: ResolvedConventionalPreset::built_in_default(),
+            repo_memory: None,
+            git_memory_context: Vec::new(),
         })
         .await
         .unwrap();
@@ -89,6 +96,54 @@ async fn surfaces_split_commit_suggestions_from_mock_server() {
     assert_eq!(
         suggestions.split[0].files,
         vec!["src/billing.rs".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn analyzes_commit_memory_from_mock_server() {
+    let mut server = Server::new_async().await;
+    let _mock = server
+        .mock("POST", "/chat/completions")
+        .match_header("authorization", "Bearer token")
+        .with_status(200)
+        .with_body(r#"{"choices":[{"message":{"content":"{\"what_changed\":[\"Adds commit-memory storage and hooks\"],\"why\":[\"Preserve intent behind each commit\",\"Make history searchable later\"],\"feature\":\"git memory\",\"related_files\":[\"src/git_memory.rs\",\"src/app.rs\"]}"}}]}"#)
+        .create_async()
+        .await;
+
+    let config = AiConfig::new(
+        "token".into(),
+        Provider::Gemini,
+        &server.url(),
+        "model",
+        CommitStyle::Standard,
+        GenerationMode::Auto,
+        ResolvedConventionalPreset::built_in_default(),
+    )
+    .unwrap();
+    let client = AiClient::new(config).unwrap();
+    let analysis = client
+        .generate_commit_memory(&CommitMemoryPromptInput {
+            sha: "abc1234".into(),
+            subject: "Add Git memory".into(),
+            body: String::new(),
+            changed_files: vec!["src/git_memory.rs".into(), "src/app.rs".into()],
+            diff_stat: "2 files changed".into(),
+            diff: "diff --git a/src/git_memory.rs b/src/git_memory.rs".into(),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        analysis,
+        CommitMemoryAnalysis {
+            what_changed: vec!["Adds commit-memory storage and hooks".to_string()],
+            why: vec![
+                "Preserve intent behind each commit".to_string(),
+                "Make history searchable later".to_string()
+            ],
+            feature: "git memory".to_string(),
+            related_files: vec!["src/app.rs".to_string(), "src/git_memory.rs".to_string()],
+        }
     );
 }
 
