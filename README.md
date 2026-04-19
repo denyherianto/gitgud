@@ -84,6 +84,7 @@ cargo run --bin gg -- commit
 | `gg auth status` | Show whether an API token is available and where it comes from |
 | `gg auth logout` | Remove the stored API token from the keychain |
 | `gg doctor` | Check Git, repo state, token availability, config resolution, and provider reachability |
+| `gg learn` | Rebuild repo-specific memory from the last 50 commits (commit style, types, scopes, branch patterns) |
 | `gg git <args>` | Pass a command straight to raw Git |
 | `gg <git-subcommand>` | Unknown Git subcommands are passed through directly |
 | `gg <natural language>` | Unrecognized input that is not a Git subcommand is routed to `ask` |
@@ -222,6 +223,8 @@ gg config unset conventional-preset
 - `gg ask` returns recommended and alternative commands with risk badges and explanations
 - dangerous actions suggested by `gg ask` require extra confirmation before execution
 - `gg push` warns about risky outgoing diffs and does not guess across ambiguous remotes
+- repo memory is built automatically on first use in any repo and refreshed every 7 days; it records commit style, conventional types/scopes, branch naming patterns, and frequently changed directories, then injects that context into every AI prompt — run `gg learn` to force an immediate rebuild
+- repo memory is stored in `~/.config/gitgud/repos/` (one TOML file per repo, never committed)
 - `gitgud` shells out to the system `git`, so hooks, credentials, and normal Git config still apply
 - detached HEAD is rejected for commit and push flows
 

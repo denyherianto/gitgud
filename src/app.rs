@@ -68,6 +68,7 @@ pub async fn run() -> Result<()> {
         Command::Config { command } => run_config(command),
         Command::Auth { command } => run_auth(command),
         Command::Doctor => run_doctor(&repo).await,
+        Command::Learn => run_learn(&repo),
     }
 }
 
@@ -89,6 +90,7 @@ async fn run_commit(repo: &GitRepo) -> Result<()> {
     repo.ensure_git_available()?;
     repo.ensure_repo()?;
 
+    let memory = crate::memory::load_or_build(repo);
     let status = repo.status()?;
     if status.staged_count == 0 {
         if status.unstaged_count > 0 {
@@ -130,6 +132,7 @@ async fn run_commit(repo: &GitRepo) -> Result<()> {
             settings.commit_style.value,
             settings.generation_mode.value,
             settings.conventional_preset.value,
+            memory,
         )
         .await?,
     )
@@ -139,6 +142,7 @@ async fn run_ship(repo: &GitRepo) -> Result<()> {
     repo.ensure_git_available()?;
     repo.ensure_repo()?;
 
+    let memory = crate::memory::load_or_build(repo);
     let initial_status = repo.status()?;
     if initial_status.staged_count > 0 || initial_status.unstaged_count > 0 {
         println!(
@@ -174,7 +178,7 @@ async fn run_ship(repo: &GitRepo) -> Result<()> {
         return Ok(());
     }
 
-    let warnings = repo.push_diff_warnings(&plan)?;
+    let warnings = repo.push_diff_warnings(&plan, memory.as_ref())?;
     if !warnings.is_empty() && !tui::confirm_unsafe_diff_warnings("shipping", &warnings)? {
         println!("ship cancelled");
         return Ok(());
@@ -187,6 +191,7 @@ async fn run_ship(repo: &GitRepo) -> Result<()> {
         &ship_range.changed_files,
         &ship_range.diff_stat,
         &ship_range.diff,
+        memory,
     )
     .await?;
     print_ship_plan(&status, &plan, &ship_range.base_label, &ship_plan);
@@ -258,6 +263,7 @@ async fn build_ship_plan(
     changed_files: &[String],
     diff_stat: &str,
     diff: &str,
+    memory: Option<crate::memory::RepoMemory>,
 ) -> Result<ShipPlan> {
     let input = ShipPromptInput {
         branch: status
@@ -277,6 +283,7 @@ async fn build_ship_plan(
         changed_files: changed_files.to_vec(),
         diff_stat: diff_stat.to_string(),
         diff: diff.to_string(),
+        repo_memory: memory,
     };
     let settings = resolve_non_secret_settings()?;
 
@@ -342,11 +349,12 @@ fn run_push(repo: &GitRepo) -> Result<()> {
     repo.ensure_git_available()?;
     repo.ensure_repo()?;
 
+    let memory = crate::memory::load_or_build(repo);
     let plan = repo.plan_push().or_else(|error| {
         tui::show_message("Cannot Push", &error.to_string())?;
         Err(error)
     })?;
-    let warnings = repo.push_diff_warnings(&plan)?;
+    let warnings = repo.push_diff_warnings(&plan, memory.as_ref())?;
     if !warnings.is_empty() && !tui::confirm_unsafe_diff_warnings("pushing", &warnings)? {
         println!("push cancelled");
         return Ok(());
@@ -534,6 +542,7 @@ async fn run_explain(repo: &GitRepo) -> Result<()> {
     repo.ensure_git_available()?;
     repo.ensure_repo()?;
 
+    let memory = crate::memory::load_or_build(repo);
     let staged = repo.staged_changes()?;
     if staged.staged_files.is_empty() {
         let message = "No staged changes found. Stage files before explaining the diff.";
@@ -551,6 +560,7 @@ async fn run_explain(repo: &GitRepo) -> Result<()> {
         diff: staged.diff,
         commit_style: config.commit_style,
         conventional_preset: config.conventional_preset.clone(),
+        repo_memory: memory,
     };
     let client = AiClient::new(config)?;
     let explanation = client.generate_diff_explanation(&input).await?;
@@ -888,6 +898,40 @@ async fn run_doctor(repo: &GitRepo) -> Result<()> {
     Ok(())
 }
 
+fn run_learn(repo: &GitRepo) -> Result<()> {
+    repo.ensure_git_available()?;
+    repo.ensure_repo()?;
+
+    println!("Scanning the last 50 commits...");
+    let memory = crate::memory::force_build(repo)?;
+
+    println!("Repo memory updated.");
+    println!("  Commit style hint : {}", memory.commit_style_hint);
+    if !memory.observed_types.is_empty() {
+        println!("  Observed types    : {}", memory.observed_types.join(", "));
+    }
+    if !memory.observed_scopes.is_empty() {
+        println!(
+            "  Observed scopes   : {}",
+            memory.observed_scopes.join(", ")
+        );
+    }
+    if !memory.branch_prefixes.is_empty() {
+        println!(
+            "  Branch prefixes   : {}",
+            memory.branch_prefixes.join(", ")
+        );
+    }
+    if !memory.risky_paths.is_empty() {
+        println!("  Risky paths       : {}", memory.risky_paths.join(", "));
+    }
+
+    let root = repo.repo_root()?;
+    let path = crate::memory::memory_path(&root)?;
+    println!("  Saved to          : {}", path.display());
+    Ok(())
+}
+
 async fn run_ask_command(repo: &GitRepo, query: &str) -> Result<()> {
     let query = query.trim();
     if query.is_empty() {
@@ -899,6 +943,7 @@ async fn run_ask_command(repo: &GitRepo, query: &str) -> Result<()> {
     repo.ensure_git_available()?;
     repo.ensure_repo()?;
 
+    let memory = crate::memory::load_or_build(repo);
     let status = repo.status()?;
     let branch = status
         .branch
@@ -911,6 +956,7 @@ async fn run_ask_command(repo: &GitRepo, query: &str) -> Result<()> {
         staged_count: status.staged_count,
         unstaged_count: status.unstaged_count,
         recent_log,
+        repo_memory: memory,
     };
 
     let config = AiConfig::load()?;

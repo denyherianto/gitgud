@@ -88,6 +88,7 @@ pub struct PromptInput {
     pub diff: String,
     pub commit_style: CommitStyle,
     pub conventional_preset: ResolvedConventionalPreset,
+    pub repo_memory: Option<crate::memory::RepoMemory>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,6 +132,7 @@ pub struct AskContext {
     pub staged_count: usize,
     pub unstaged_count: usize,
     pub recent_log: String,
+    pub repo_memory: Option<crate::memory::RepoMemory>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,6 +151,7 @@ pub struct ShipPromptInput {
     pub changed_files: Vec<String>,
     pub diff_stat: String,
     pub diff: String,
+    pub repo_memory: Option<crate::memory::RepoMemory>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -417,15 +420,62 @@ pub fn normalize_base_api_url(raw: &str) -> Result<String> {
     Ok(url.to_string().trim_end_matches('/').to_string())
 }
 
-pub fn build_commit_prompt(input: &PromptInput) -> String {
+fn build_repo_memory_block(memory: &crate::memory::RepoMemory) -> String {
+    let mut parts = Vec::new();
+    if !memory.commit_style_hint.is_empty() {
+        parts.push(format!(
+            "Observed commit style: {}",
+            memory.commit_style_hint
+        ));
+    }
+    if !memory.observed_types.is_empty() {
+        parts.push(format!(
+            "Observed conventional types: {}",
+            memory.observed_types.join(", ")
+        ));
+    }
+    if !memory.observed_scopes.is_empty() {
+        parts.push(format!(
+            "Observed conventional scopes: {}",
+            memory.observed_scopes.join(", ")
+        ));
+    }
+    if !memory.branch_prefixes.is_empty() {
+        parts.push(format!(
+            "Branch naming patterns: {}",
+            memory.branch_prefixes.join(", ")
+        ));
+    }
+    if !memory.risky_paths.is_empty() {
+        parts.push(format!(
+            "Frequently changed directories (handle with care): {}",
+            memory.risky_paths.join(", ")
+        ));
+    }
+    if parts.is_empty() {
+        return String::new();
+    }
     format!(
-        "Commit style: {}{}\n{}",
+        "\n\nRepo memory (learned from history):\n{}",
+        parts.join("\n")
+    )
+}
+
+pub fn build_commit_prompt(input: &PromptInput) -> String {
+    let memory_block = input
+        .repo_memory
+        .as_ref()
+        .map(build_repo_memory_block)
+        .unwrap_or_default();
+    format!(
+        "Commit style: {}{}\n{}{}",
         match input.commit_style {
             CommitStyle::Standard => "standard",
             CommitStyle::Conventional => "conventional",
         },
         build_conventional_context(input),
-        build_diff_context(input, DEFAULT_MAX_DIFF_CHARS)
+        build_diff_context(input, DEFAULT_MAX_DIFF_CHARS),
+        memory_block
     )
 }
 
@@ -707,9 +757,14 @@ fn build_ask_user_prompt(query: &str, context: &AskContext) -> String {
     } else {
         context.recent_log.clone()
     };
+    let memory_block = context
+        .repo_memory
+        .as_ref()
+        .map(build_repo_memory_block)
+        .unwrap_or_default();
     format!(
-        "Query: {}\n\nContext:\nBranch: {}\nStaged files: {}\nUnstaged files: {}\nRecent commits:\n{}",
-        query, context.branch, context.staged_count, context.unstaged_count, log
+        "Query: {}\n\nContext:\nBranch: {}\nStaged files: {}\nUnstaged files: {}\nRecent commits:\n{}{}",
+        query, context.branch, context.staged_count, context.unstaged_count, log, memory_block
     )
 }
 
@@ -741,8 +796,13 @@ fn build_ship_user_prompt(input: &ShipPromptInput) -> String {
         input.changed_files.join(", ")
     };
 
+    let memory_block = input
+        .repo_memory
+        .as_ref()
+        .map(build_repo_memory_block)
+        .unwrap_or_default();
     format!(
-        "Branch: {}\nBase branch: {}\nStaged files: {}\nUnstaged files: {}\nChanged files: {}\n\nLocal commits:\n{}\n\nOutgoing diff stat:\n{}\n\nOutgoing diff:\n{}",
+        "Branch: {}\nBase branch: {}\nStaged files: {}\nUnstaged files: {}\nChanged files: {}\n\nLocal commits:\n{}\n\nOutgoing diff stat:\n{}\n\nOutgoing diff:\n{}{}",
         input.branch,
         input.base_label,
         input.staged_count,
@@ -750,7 +810,8 @@ fn build_ship_user_prompt(input: &ShipPromptInput) -> String {
         changed_files,
         commits,
         input.diff_stat,
-        truncate_diff(&input.diff, DEFAULT_MAX_DIFF_CHARS)
+        truncate_diff(&input.diff, DEFAULT_MAX_DIFF_CHARS),
+        memory_block
     )
 }
 
@@ -848,6 +909,7 @@ fn parse_commit_suggestions(raw: &str, commit_style: CommitStyle) -> Result<Comm
         diff: "diff --git a/src/billing.rs b/src/billing.rs\n+fn billing_summary_card() {}\ndiff --git a/src/subscription.rs b/src/subscription.rs\n+if status == null {\n+    return;\n+}\n".into(),
         commit_style,
         conventional_preset: ResolvedConventionalPreset::built_in_default(),
+        repo_memory: None,
     };
 
     parse_commit_suggestions_with_preset(
@@ -932,6 +994,7 @@ fn parse_commit_options(raw: &str, commit_style: CommitStyle) -> Result<Vec<Stri
             diff: String::new(),
             commit_style,
             conventional_preset: ResolvedConventionalPreset::built_in_default(),
+            repo_memory: None,
         },
         commit_style,
         &ResolvedConventionalPreset::built_in_default(),
@@ -1098,6 +1161,7 @@ fn fallback_pr_title(input: &ShipPromptInput) -> String {
         diff: input.diff.clone(),
         commit_style: CommitStyle::Standard,
         conventional_preset: ResolvedConventionalPreset::built_in_default(),
+        repo_memory: None,
     };
     let fallback = build_heuristic_commit_options(&summary_input)
         .into_iter()
@@ -2081,6 +2145,7 @@ mod tests {
             diff: "diff --git".into(),
             commit_style: CommitStyle::Standard,
             conventional_preset: default_preset(),
+            repo_memory: None,
         });
 
         assert!(prompt.contains("Branch: main"));
@@ -2098,6 +2163,7 @@ mod tests {
             diff: "diff --git".into(),
             commit_style: CommitStyle::Conventional,
             conventional_preset: default_preset(),
+            repo_memory: None,
         });
 
         assert!(prompt.contains("Conventional preset: default"));
@@ -2113,6 +2179,7 @@ mod tests {
             diff: "diff --git".into(),
             commit_style: CommitStyle::Standard,
             conventional_preset: default_preset(),
+            repo_memory: None,
         });
 
         assert!(prompt.contains("what changed"));
@@ -2249,6 +2316,7 @@ mod tests {
                 .into(),
             commit_style: CommitStyle::Conventional,
             conventional_preset: default_preset(),
+            repo_memory: None,
         };
         let preset = default_preset();
         let suggestions = parse_commit_suggestions_with_preset(
@@ -2315,6 +2383,7 @@ mod tests {
             diff: "diff --git".into(),
             commit_style: CommitStyle::Standard,
             conventional_preset: default_preset(),
+            repo_memory: None,
         });
 
         assert_eq!(options[0], "Update release workflow");
@@ -2330,6 +2399,7 @@ mod tests {
             diff: "diff --git a/src/ai.rs b/src/ai.rs\n+retry request before fallback\n+handle timeout explicitly".into(),
             commit_style: CommitStyle::Standard,
             conventional_preset: default_preset(),
+            repo_memory: None,
         });
 
         assert_eq!(options[0], "Retry ai generation before fallback");
@@ -2346,6 +2416,7 @@ mod tests {
             diff: "diff --git a/src/fallback.rs b/src/fallback.rs\nnew file mode 100644\n--- /dev/null\n+++ b/src/fallback.rs\n+fn render() {}\n".into(),
             commit_style: CommitStyle::Standard,
             conventional_preset: default_preset(),
+            repo_memory: None,
         });
 
         assert_eq!(options[0], "Improve fallback");
@@ -2362,6 +2433,7 @@ mod tests {
             diff: "diff --git".into(),
             commit_style: CommitStyle::Conventional,
             conventional_preset: default_preset(),
+            repo_memory: None,
         });
 
         assert!(options[0].starts_with("feat(tui): "));
@@ -2379,6 +2451,7 @@ mod tests {
             diff: "diff --git a/src/billing.rs b/src/billing.rs\n+fn billing_summary_card() {}\ndiff --git a/src/subscription.rs b/src/subscription.rs\n+if status == null {\n+    return;\n+}\n".into(),
             commit_style: CommitStyle::Conventional,
             conventional_preset: default_preset(),
+            repo_memory: None,
         });
 
         assert_eq!(suggestions.split.len(), 2);
@@ -2403,6 +2476,7 @@ mod tests {
             diff: "diff --git a/README.md b/README.md\n+Add split commit guidance\ndiff --git a/tests/ai_provider.rs b/tests/ai_provider.rs\n+fn covers_split_suggestions() {}\n".into(),
             commit_style: CommitStyle::Standard,
             conventional_preset: default_preset(),
+            repo_memory: None,
         });
 
         assert_eq!(
@@ -2429,6 +2503,7 @@ mod tests {
             diff: "diff --git a/src/tui.rs b/src/tui.rs\n+fn render_commit_view() {}\ndiff --git a/src/tui/input.rs b/src/tui/input.rs\n+fn handle_commit_input() {}\n".into(),
             commit_style: CommitStyle::Conventional,
             conventional_preset: default_preset(),
+            repo_memory: None,
         });
 
         assert!(suggestions.split.is_empty());
@@ -2446,6 +2521,7 @@ mod tests {
                 name: "team".into(),
                 types: vec!["bugfix".into(), "maintenance".into()],
             },
+            repo_memory: None,
         });
 
         assert!(suggestions.options[0].starts_with("bugfix(parser): "));
@@ -2496,6 +2572,7 @@ mod tests {
             staged_count: 2,
             unstaged_count: 1,
             recent_log: "abc1234 feat: add login\ndef5678 fix: auth bug".into(),
+            repo_memory: None,
         };
         let prompt = build_ask_user_prompt("undo last commit", &context);
 
@@ -2542,6 +2619,7 @@ mod tests {
             changed_files: vec!["src/app.rs".into(), "README.md".into()],
             diff_stat: "2 files changed".into(),
             diff: "diff --git a/src/app.rs b/src/app.rs\n+run ship".into(),
+            repo_memory: None,
         });
 
         assert!(prompt.contains("Branch: feature/ship"));
@@ -2574,6 +2652,7 @@ mod tests {
             changed_files: vec!["src/app.rs".into(), "tests/git_flow.rs".into()],
             diff_stat: "2 files changed".into(),
             diff: "diff --git a/src/app.rs b/src/app.rs\n+run ship".into(),
+            repo_memory: None,
         });
 
         assert!(!plan.commit_cleanup.is_empty());

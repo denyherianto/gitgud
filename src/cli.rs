@@ -52,6 +52,8 @@ pub enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         query: Vec<String>,
     },
+    /// Rebuild repo-specific memory by scanning the last 50 commits
+    Learn,
     #[command(external_subcommand)]
     Passthrough(Vec<OsString>),
 }

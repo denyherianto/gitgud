@@ -115,6 +115,7 @@ pub async fn run_commit(
     commit_style: CommitStyle,
     generation_mode: GenerationMode,
     conventional_preset: ResolvedConventionalPreset,
+    memory: Option<crate::memory::RepoMemory>,
 ) -> Result<CommitAction> {
     let branch = repo.current_branch().or_else(|error| {
         show_message("Cannot Commit", &error.to_string())?;
@@ -135,6 +136,7 @@ pub async fn run_commit(
         diff: staged.diff,
         commit_style,
         conventional_preset: conventional_preset.clone(),
+        repo_memory: memory,
     };
 
     let mut state = CommitView::new(

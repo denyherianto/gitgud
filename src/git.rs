@@ -196,10 +196,18 @@ impl GitRepo {
         Ok(collect_unsafe_diff_warnings(&snapshot))
     }
 
-    pub fn push_diff_warnings(&self, plan: &PushPlan) -> Result<Vec<UnsafeDiffWarning>> {
+    pub fn push_diff_warnings(
+        &self,
+        plan: &PushPlan,
+        memory: Option<&crate::memory::RepoMemory>,
+    ) -> Result<Vec<UnsafeDiffWarning>> {
         let base = self.push_diff_base(plan)?;
         let snapshot = self.diff_snapshot(&["diff", base.as_str(), "HEAD"])?;
-        Ok(collect_unsafe_diff_warnings(&snapshot))
+        let mut warnings = collect_unsafe_diff_warnings(&snapshot);
+        if let Some(mem) = memory {
+            append_risky_path_warnings(&snapshot.changed_files, &mem.risky_paths, &mut warnings);
+        }
+        Ok(warnings)
     }
 
     pub fn ship_range(&self, plan: &PushPlan) -> Result<ShipRange> {
@@ -307,6 +315,23 @@ impl GitRepo {
         let limit = format!("-{count}");
         let args = ["log", "--oneline", limit.as_str()];
         self.run_checked_slice(&args)
+    }
+
+    pub fn repo_root(&self) -> Result<PathBuf> {
+        self.run_checked(["rev-parse", "--show-toplevel"])
+            .map(|output| PathBuf::from(output.trim()))
+    }
+
+    pub fn recent_commits(&self, count: usize) -> Result<Vec<BranchCommit>> {
+        let limit = format!("-{count}");
+        let output =
+            self.run_checked_slice(&["log", "--format=%H%x1f%s%x1f%b%x1e", limit.as_str()])?;
+        Ok(parse_branch_commits(&output))
+    }
+
+    pub fn name_only_log(&self, count: usize) -> Result<String> {
+        let limit = format!("-{count}");
+        self.run_checked_slice(&["log", "--name-only", "--format=%x1e", limit.as_str()])
     }
 
     pub fn head_sha(&self) -> Result<String> {
@@ -668,6 +693,36 @@ impl GitRepo {
             .args(args)
             .output()
             .with_context(|| format!("failed to execute git {}", args.join(" ")))
+    }
+}
+
+fn append_risky_path_warnings(
+    changed_files: &[String],
+    risky_paths: &[String],
+    warnings: &mut Vec<UnsafeDiffWarning>,
+) {
+    if risky_paths.is_empty() {
+        return;
+    }
+    let matched: Vec<&str> = changed_files
+        .iter()
+        .filter(|path| {
+            risky_paths.iter().any(|rp| {
+                let prefix = rp.trim_end_matches('/');
+                path.starts_with(&format!("{prefix}/")) || path.as_str() == prefix
+            })
+        })
+        .map(String::as_str)
+        .collect();
+    if !matched.is_empty() {
+        let display = if matched.len() <= 3 {
+            matched.join(", ")
+        } else {
+            format!("{} and {} more", matched[..3].join(", "), matched.len() - 3)
+        };
+        warnings.push(UnsafeDiffWarning {
+            message: format!("frequently changed paths detected (review carefully): {display}"),
+        });
     }
 }
 
