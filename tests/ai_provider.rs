@@ -52,7 +52,7 @@ async fn generates_commit_message_from_mock_server() {
 }
 
 #[tokio::test]
-async fn surfaces_split_commit_suggestions_from_mock_server() {
+async fn ignores_split_commit_suggestions_from_mock_server() {
     let mut server = Server::new_async().await;
     let _mock = server
         .mock("POST", "/chat/completions")
@@ -88,14 +88,9 @@ async fn surfaces_split_commit_suggestions_from_mock_server() {
         .unwrap();
 
     assert_eq!(suggestions.options.len(), 1);
-    assert_eq!(suggestions.split.len(), 2);
     assert_eq!(
-        suggestions.split[0].message,
-        "feat(billing): add billing summary card"
-    );
-    assert_eq!(
-        suggestions.split[0].files,
-        vec!["src/billing.rs".to_string()]
+        suggestions.options[0],
+        "feat(billing): update billing and subscription flow"
     );
 }
 

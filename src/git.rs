@@ -1,13 +1,11 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     ffi::OsString,
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Output, Stdio},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-
-use crate::ai::SplitCommitPlan;
 
 #[derive(Debug, Clone)]
 pub struct GitRepo {
@@ -268,58 +266,6 @@ impl GitRepo {
 
     pub fn stage_all(&self) -> Result<String> {
         self.run_checked(["add", "--all"])
-    }
-
-    pub fn stage_paths(&self, paths: &[String]) -> Result<String> {
-        if paths.is_empty() {
-            bail!("cannot stage an empty file selection");
-        }
-
-        let mut args = Vec::with_capacity(paths.len() + 2);
-        args.push("add");
-        args.push("--");
-        for path in paths {
-            args.push(path.as_str());
-        }
-        self.run_checked_slice(&args)
-    }
-
-    pub fn clear_staging(&self) -> Result<String> {
-        self.run_checked(["reset", "--mixed", "--quiet"])
-    }
-
-    pub fn split_commit(&self, plans: &[SplitCommitPlan]) -> Result<()> {
-        if plans.len() < 2 {
-            bail!("split commit requires at least two commits");
-        }
-
-        let staged = self.staged_changes()?;
-        if staged.staged_files.is_empty() {
-            bail!("no staged changes found");
-        }
-
-        validate_split_plan(plans, &staged.staged_files)?;
-
-        self.clear_staging()?;
-
-        let mut committed = 0usize;
-        for plan in plans {
-            if let Err(error) = self
-                .stage_paths(&plan.files)
-                .and_then(|_| self.commit(&plan.message).map(|_| ()))
-            {
-                if committed == 0 {
-                    let _ = self.stage_paths(&staged.staged_files);
-                    return Err(error.context("split commit failed before creating any commits"));
-                }
-
-                bail!("split commit stopped after {committed} commits: {error}");
-            }
-
-            committed += 1;
-        }
-
-        Ok(())
     }
 
     pub fn recent_log(&self, count: usize) -> Result<String> {
@@ -877,35 +823,6 @@ fn shorten_remote_ref(raw: &str) -> String {
         .strip_prefix("refs/remotes/")
         .unwrap_or(raw.trim())
         .to_string()
-}
-
-fn validate_split_plan(plans: &[SplitCommitPlan], staged_files: &[String]) -> Result<()> {
-    let expected = staged_files.iter().cloned().collect::<BTreeSet<_>>();
-    let mut seen = BTreeSet::new();
-
-    for plan in plans {
-        if plan.message.trim().is_empty() {
-            bail!("split commit messages cannot be empty");
-        }
-        if plan.files.is_empty() {
-            bail!("split commits must include at least one file");
-        }
-
-        for file in &plan.files {
-            if !expected.contains(file) {
-                bail!("split commit referenced an unstaged file: {file}");
-            }
-            if !seen.insert(file.clone()) {
-                bail!("split commit referenced a file more than once: {file}");
-            }
-        }
-    }
-
-    if seen != expected {
-        bail!("split commits must cover every staged file exactly once");
-    }
-
-    Ok(())
 }
 
 // Canonical SHA-1 hash of Git's empty tree object, used as the diff base

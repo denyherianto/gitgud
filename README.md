@@ -201,7 +201,7 @@ Notes:
 
 ## Commit Modes
 
-- `auto`: use the configured AI provider, fall back to heuristic suggestions on timeout, and ignore malformed AI split plans by showing heuristic split suggestions instead
+- `auto`: use the configured AI provider and fall back to heuristic suggestions on timeout
 - `ai-only`: require the AI provider and surface provider errors
 - `heuristic-only`: skip the AI provider and generate local suggestions only
 
@@ -245,7 +245,7 @@ gg config unset conventional-preset
 - supported rescue incidents are `wrong-branch`, `detached-head`, `bad-rebase`, `lost-stash`, `accidental-reset`, and `force-push`
 - force-push rescue can restore from a detected commit or a manual SHA/ref fallback and only fetches remote refs after confirmation
 - `gg commit` and `gg explain` only use staged changes
-- `gg commit` warns about risky staged diffs, supports inline editing, and can propose split commits for mixed concerns
+- `gg commit` warns about risky staged diffs, supports inline editing, and creates one commit from the staged changes
 - `gg ship` can roll staged work into the existing commit flow first, surfaces split/squash cleanup suggestions for the outgoing branch, drafts a review title/body, and pushes
 - `gg ask` returns recommended and alternative commands with risk badges and explanations
 - dangerous actions suggested by `gg ask` require extra confirmation before execution

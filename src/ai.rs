@@ -95,7 +95,6 @@ pub struct PromptInput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitSuggestions {
     pub options: Vec<String>,
-    pub split: Vec<SplitCommitPlan>,
     pub note: Option<String>,
 }
 
@@ -105,12 +104,6 @@ pub struct DiffExplanation {
     pub possible_intent: Vec<String>,
     pub risk_areas: Vec<String>,
     pub test_suggestions: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SplitCommitPlan {
-    pub message: String,
-    pub files: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -683,7 +676,6 @@ pub fn build_heuristic_commit_suggestions(input: &PromptInput) -> CommitSuggesti
 
     CommitSuggestions {
         options: candidates.into_iter().map(limit_subject_to_72).collect(),
-        split: build_heuristic_split_suggestions(input),
         note: None,
     }
 }
@@ -816,7 +808,7 @@ fn build_system_prompt(
     };
 
     format!(
-        "You write concise Git commit messages. Return valid JSON only with this shape: {{\"options\":[\"message 1\",\"message 2\",\"message 3\"],\"split\":[{{\"message\":\"message a\",\"files\":[\"path/a.rs\"]}},{{\"message\":\"message b\",\"files\":[\"path/b.rs\"]}}]}}. Provide 1 to 3 distinct options in `options`. Add `split` only when the staged changes mix multiple concerns that should be committed separately; when present, `split` must contain 2 to 4 objects and each object must include a commit `message` plus the staged `files` that belong in that commit. The split plan must cover every staged file exactly once. Each message may include a blank line and body, but no markdown fences, labels, numbering, or commentary. Describe only the staged changes. {style_rules}"
+        "You write concise Git commit messages. Return valid JSON only with this shape: {{\"options\":[\"message 1\",\"message 2\",\"message 3\"]}}. Provide 1 to 3 distinct options in `options`. Each message may include a blank line and body, but no markdown fences, labels, numbering, extra arrays, or commentary. Describe only the staged changes. {style_rules}"
     )
 }
 
@@ -1006,7 +998,7 @@ fn parse_commit_suggestions(raw: &str, commit_style: CommitStyle) -> Result<Comm
 
 fn parse_commit_suggestions_with_preset(
     raw: &str,
-    input: &PromptInput,
+    _input: &PromptInput,
     commit_style: CommitStyle,
     conventional_preset: &ResolvedConventionalPreset,
 ) -> Result<CommitSuggestions> {
@@ -1024,40 +1016,10 @@ fn parse_commit_suggestions_with_preset(
         )?);
     }
 
-    let (split, note) =
-        resolve_split_plans_with_fallback(parsed.split, input, commit_style, conventional_preset)?;
-
     Ok(CommitSuggestions {
         options,
-        split,
-        note,
+        note: None,
     })
-}
-
-fn resolve_split_plans_with_fallback(
-    split: Vec<SplitPlanPayload>,
-    input: &PromptInput,
-    commit_style: CommitStyle,
-    conventional_preset: &ResolvedConventionalPreset,
-) -> Result<(Vec<SplitCommitPlan>, Option<String>)> {
-    if split.is_empty() {
-        return Ok((Vec::new(), None));
-    }
-
-    if !(2..=4).contains(&split.len()) {
-        return Ok((
-            build_heuristic_split_suggestions(input),
-            Some("AI split plan was invalid. Showing heuristic split suggestions.".to_string()),
-        ));
-    }
-
-    match resolve_split_plans(split, input, commit_style, conventional_preset) {
-        Ok(plans) => Ok((plans, None)),
-        Err(_) => Ok((
-            build_heuristic_split_suggestions(input),
-            Some("AI split plan was invalid. Showing heuristic split suggestions.".to_string()),
-        )),
-    }
 }
 
 fn parse_diff_explanation(raw: &str) -> Result<DiffExplanation> {
@@ -1160,103 +1122,6 @@ fn parse_commit_options(raw: &str, commit_style: CommitStyle) -> Result<Vec<Stri
         &ResolvedConventionalPreset::built_in_default(),
     )
     .map(|parsed| parsed.options)
-}
-
-fn resolve_split_plans(
-    split: Vec<SplitPlanPayload>,
-    input: &PromptInput,
-    commit_style: CommitStyle,
-    conventional_preset: &ResolvedConventionalPreset,
-) -> Result<Vec<SplitCommitPlan>> {
-    if split.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let heuristic = build_heuristic_split_suggestions(input);
-    let all_structured = split
-        .iter()
-        .all(|item| matches!(item, SplitPlanPayload::Plan { .. }));
-    if all_structured {
-        let provider =
-            validate_provider_split_plans(split, input, commit_style, conventional_preset)?;
-        return Ok(provider);
-    }
-
-    if heuristic.len() == split.len() {
-        let mut plans = Vec::with_capacity(split.len());
-        for (item, heuristic_plan) in split.into_iter().zip(heuristic) {
-            let message = match item {
-                SplitPlanPayload::Message(message) => message,
-                SplitPlanPayload::Plan { message, .. } => message,
-            };
-            plans.push(SplitCommitPlan {
-                message: normalize_generated_commit_message_with_preset(
-                    &message,
-                    commit_style,
-                    conventional_preset,
-                )?,
-                files: heuristic_plan.files,
-            });
-        }
-        return Ok(plans);
-    }
-
-    Ok(heuristic)
-}
-
-fn validate_provider_split_plans(
-    split: Vec<SplitPlanPayload>,
-    input: &PromptInput,
-    commit_style: CommitStyle,
-    conventional_preset: &ResolvedConventionalPreset,
-) -> Result<Vec<SplitCommitPlan>> {
-    let mut plans = Vec::with_capacity(split.len());
-    let mut seen_files = BTreeMap::new();
-    let staged_files = input
-        .staged_files
-        .iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>();
-
-    for item in split {
-        let SplitPlanPayload::Plan { message, files } = item else {
-            bail!("AI provider split suggestions must include files");
-        };
-        if files.is_empty() {
-            bail!("AI provider split suggestions must include at least one file per commit");
-        }
-
-        let mut unique_files = Vec::with_capacity(files.len());
-        for file in files {
-            if !staged_files.iter().any(|staged| *staged == file) {
-                bail!("AI provider split suggestions referenced an unstaged file: {file}");
-            }
-            if seen_files.insert(file.clone(), message.clone()).is_none() {
-                unique_files.push(file);
-            } else {
-                bail!("AI provider split suggestions assigned a file to multiple commits");
-            }
-        }
-
-        plans.push(SplitCommitPlan {
-            message: normalize_generated_commit_message_with_preset(
-                &message,
-                commit_style,
-                conventional_preset,
-            )?,
-            files: unique_files,
-        });
-    }
-
-    if input
-        .staged_files
-        .iter()
-        .any(|file| !seen_files.contains_key(file))
-    {
-        bail!("AI provider split suggestions must cover every staged file");
-    }
-
-    Ok(plans)
 }
 
 fn parse_options_payload(raw: &str) -> Result<CommitOptionsPayload> {
@@ -1542,200 +1407,6 @@ fn is_timeout_error(error: &anyhow::Error) -> bool {
             .downcast_ref::<reqwest::Error>()
             .is_some_and(reqwest::Error::is_timeout)
     })
-}
-
-fn build_heuristic_split_suggestions(input: &PromptInput) -> Vec<SplitCommitPlan> {
-    let concerns = collect_concerns(input);
-    if concerns.len() < 2 {
-        return Vec::new();
-    }
-
-    concerns
-        .into_iter()
-        .take(4)
-        .map(|concern| {
-            let message = limit_subject_to_72(build_split_message(
-                &concern,
-                input.commit_style,
-                &input.conventional_preset.types,
-            ));
-            SplitCommitPlan {
-                message,
-                files: concern.files,
-            }
-        })
-        .collect()
-}
-
-fn build_split_message(
-    concern: &Concern,
-    commit_style: CommitStyle,
-    conventional_types: &[String],
-) -> String {
-    let is_fix = concern.diff_mentions_fix || concern.label.contains("fix");
-    let is_feature = concern.diff_mentions_feature;
-
-    match commit_style {
-        CommitStyle::Standard => {
-            if concern.kind == ConcernKind::Docs {
-                format!("Update {}", concern.label)
-            } else if concern.kind == ConcernKind::Tests {
-                format!("Expand {} coverage", concern.label)
-            } else if concern.kind == ConcernKind::Ci {
-                format!("Update {}", concern.label)
-            } else if is_fix {
-                format!("Fix {} handling", concern.label)
-            } else if is_feature {
-                format!("Add {}", concern.label)
-            } else {
-                format!("Update {}", concern.label)
-            }
-        }
-        CommitStyle::Conventional => {
-            let preferred_types: &[&str] = match concern.kind {
-                ConcernKind::Docs => &["docs", "chore"],
-                ConcernKind::Tests => &["test", "chore"],
-                ConcernKind::Ci => &["ci", "build", "chore"],
-                ConcernKind::Install => &["build", "chore"],
-                ConcernKind::Other => &["chore", "build"],
-                ConcernKind::Source if is_fix => &["fix", "refactor", "chore"],
-                ConcernKind::Source if is_feature => &["feat", "refactor", "chore"],
-                ConcernKind::Source => &["feat", "refactor", "chore"],
-            };
-            let commit_type = pick_conventional_type(conventional_types, preferred_types);
-            let scope = sanitize_scope(&concern.scope);
-            let description = match concern.kind {
-                ConcernKind::Docs => format!("update {}", concern.label),
-                ConcernKind::Tests => format!("expand {} coverage", concern.label),
-                ConcernKind::Ci | ConcernKind::Install | ConcernKind::Other => {
-                    format!("update {}", concern.label)
-                }
-                ConcernKind::Source if is_fix => format!("handle {}", concern.label),
-                ConcernKind::Source if is_feature => format!("add {}", concern.label),
-                ConcernKind::Source => format!("update {}", concern.label),
-            };
-
-            if scope.is_empty() {
-                format!("{commit_type}: {description}")
-            } else {
-                format!("{commit_type}({scope}): {description}")
-            }
-        }
-    }
-}
-
-fn collect_concerns(input: &PromptInput) -> Vec<Concern> {
-    let diffs_by_path = split_diff_by_path(&input.diff);
-    let mut concerns: Vec<Concern> = Vec::new();
-
-    for path in &input.staged_files {
-        let Some(mut concern) = classify_concern(path) else {
-            continue;
-        };
-
-        if let Some(diff) = diffs_by_path.get(path) {
-            let diff_lower = diff.to_ascii_lowercase();
-            concern.diff_mentions_fix = contains_any(
-                &diff_lower,
-                &[
-                    "null", "none", "missing", "fallback", "guard", "error", "handle",
-                ],
-            );
-            concern.diff_mentions_feature = contains_any(
-                &diff_lower,
-                &[
-                    "add ", "new ", "create", "card", "screen", "page", "summary",
-                ],
-            );
-        }
-
-        if let Some(existing) = concerns.iter_mut().find(|item| {
-            let item = &**item;
-            item.kind == concern.kind && item.scope == concern.scope && item.label == concern.label
-        }) {
-            existing.diff_mentions_fix |= concern.diff_mentions_fix;
-            existing.diff_mentions_feature |= concern.diff_mentions_feature;
-            existing.files.push(path.clone());
-        } else {
-            concern.files.push(path.clone());
-            concerns.push(concern);
-        }
-    }
-
-    concerns
-}
-
-fn classify_concern(path: &str) -> Option<Concern> {
-    if path == "README.md" || path.starts_with("docs/") {
-        return Some(Concern::new(ConcernKind::Docs, "docs", "documentation"));
-    }
-
-    if path.starts_with("tests/") {
-        let label = path
-            .strip_prefix("tests/")
-            .and_then(|rest| rest.split('/').next())
-            .and_then(|segment| segment.split('.').next())
-            .map(humanize_identifier)
-            .filter(|label| !label.is_empty())
-            .unwrap_or_else(|| "tests".to_string());
-        return Some(Concern::new(ConcernKind::Tests, "tests", &label));
-    }
-
-    if path.starts_with(".github/workflows/") {
-        return Some(Concern::new(ConcernKind::Ci, "release", "release workflow"));
-    }
-
-    if path == "install.sh" {
-        return Some(Concern::new(ConcernKind::Install, "install", "installer"));
-    }
-
-    if let Some(rest) = path.strip_prefix("src/") {
-        let module = rest
-            .split('/')
-            .next()
-            .and_then(|segment| segment.split('.').next())
-            .filter(|segment| !segment.is_empty())
-            .unwrap_or("project");
-        let label = humanize_identifier(module);
-        return Some(Concern::new(ConcernKind::Source, module, &label));
-    }
-
-    let top_level = path
-        .split('/')
-        .next()
-        .and_then(|segment| segment.split('.').next())
-        .filter(|segment| !segment.is_empty())?;
-    let label = humanize_identifier(top_level);
-    Some(Concern::new(ConcernKind::Other, top_level, &label))
-}
-
-fn split_diff_by_path(diff: &str) -> BTreeMap<String, String> {
-    let mut segments = BTreeMap::new();
-    let mut current_path: Option<String> = None;
-    let mut current_lines = String::new();
-
-    for line in diff.lines() {
-        if let Some(rest) = line.strip_prefix("diff --git a/") {
-            if let Some(path) = current_path.take() {
-                segments.insert(path, current_lines.trim().to_string());
-                current_lines.clear();
-            }
-
-            current_path = rest
-                .split_once(" b/")
-                .map(|(_, path)| path.to_string())
-                .or_else(|| rest.split_whitespace().nth(1).map(str::to_string));
-        } else if current_path.is_some() {
-            current_lines.push_str(line);
-            current_lines.push('\n');
-        }
-    }
-
-    if let Some(path) = current_path {
-        segments.insert(path, current_lines.trim().to_string());
-    }
-
-    segments
 }
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
@@ -2165,8 +1836,6 @@ struct ChatResponseMessage {
 #[derive(Debug, Deserialize)]
 struct CommitOptionsPayload {
     options: Vec<String>,
-    #[serde(default)]
-    split: Vec<SplitPlanPayload>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2227,57 +1896,16 @@ struct ModelPayload {
     created: Option<u64>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum SplitPlanPayload {
-    Message(String),
-    Plan { message: String, files: Vec<String> },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Concern {
-    kind: ConcernKind,
-    scope: String,
-    label: String,
-    diff_mentions_fix: bool,
-    diff_mentions_feature: bool,
-    files: Vec<String>,
-}
-
-impl Concern {
-    fn new(kind: ConcernKind, scope: &str, label: &str) -> Self {
-        Self {
-            kind,
-            scope: scope.to_string(),
-            label: label.to_string(),
-            diff_mentions_fix: false,
-            diff_mentions_feature: false,
-            files: Vec::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ConcernKind {
-    Docs,
-    Tests,
-    Ci,
-    Install,
-    Source,
-    Other,
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
     use super::{
         AiConfig, AskContext, AskSuggestion, DEFAULT_BASE_API_URL, DiffExplanation, ModelPayload,
-        ShipCommit, ShipPlan, ShipPromptInput, SplitCommitPlan, SuggestedCommand,
-        build_ask_user_prompt, build_commit_prompt, build_diff_explanation_prompt,
-        build_heuristic_commit_options, build_heuristic_commit_suggestions,
-        build_heuristic_ship_plan, build_ship_user_prompt, collect_model_options,
-        normalize_base_api_url, parse_ask_suggestion, parse_commit_options,
+        ShipCommit, ShipPlan, ShipPromptInput, SuggestedCommand, build_ask_user_prompt,
+        build_commit_prompt, build_diff_explanation_prompt, build_heuristic_commit_options,
+        build_heuristic_commit_suggestions, build_heuristic_ship_plan, build_ship_user_prompt,
+        collect_model_options, normalize_base_api_url, parse_ask_suggestion, parse_commit_options,
         parse_commit_suggestions, parse_commit_suggestions_with_preset, parse_diff_explanation,
         parse_ship_plan, truncate_diff, validate_commit_message,
         validate_commit_message_with_preset,
@@ -2469,7 +2097,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_split_commit_suggestions_json() {
+    fn ignores_split_commit_suggestions_json() {
         let suggestions = parse_commit_suggestions(
             r#"{"options":["Update billing flow"],"split":["Add billing summary card","Fix subscription status handling"]}"#,
             CommitStyle::Standard,
@@ -2477,12 +2105,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(suggestions.options.len(), 1);
-        assert_eq!(suggestions.split.len(), 2);
-        assert_eq!(suggestions.split[0].message, "Add billing summary card");
-        assert_eq!(
-            suggestions.split[0].files,
-            vec!["src/billing.rs".to_string()]
-        );
+        assert_eq!(suggestions.options[0], "Update billing flow");
     }
 
     #[test]
@@ -2506,7 +2129,7 @@ mod tests {
     }
 
     #[test]
-    fn trims_long_generated_split_messages() {
+    fn ignores_structured_split_commit_suggestions() {
         let input = super::PromptInput {
             branch: "main".into(),
             staged_files: vec!["src/main.rs".into(), "src/lib.rs".into()],
@@ -2527,17 +2150,14 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(suggestions.split.len(), 2);
-        assert!(
-            suggestions
-                .split
-                .iter()
-                .all(|plan| plan.message.chars().count() <= 72)
+        assert_eq!(
+            suggestions.options,
+            vec!["feat(billing): update billing flow".to_string()]
         );
     }
 
     #[test]
-    fn falls_back_when_split_commit_suggestions_have_invalid_count() {
+    fn ignores_invalid_split_commit_suggestions() {
         let suggestions = parse_commit_suggestions(
             r#"{"options":["Update billing flow"],"split":["Add billing summary card"]}"#,
             CommitStyle::Standard,
@@ -2545,15 +2165,11 @@ mod tests {
         .unwrap();
 
         assert_eq!(suggestions.options, vec!["Update billing flow".to_string()]);
-        assert_eq!(suggestions.split.len(), 2);
-        assert_eq!(
-            suggestions.note,
-            Some("AI split plan was invalid. Showing heuristic split suggestions.".to_string())
-        );
+        assert_eq!(suggestions.note, None);
     }
 
     #[test]
-    fn falls_back_when_provider_split_reuses_a_file() {
+    fn ignores_provider_split_that_reuses_a_file() {
         let input = super::PromptInput {
             branch: "feature/billing".into(),
             staged_files: vec!["src/billing.rs".into(), "src/subscription.rs".into()],
@@ -2574,19 +2190,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(suggestions.options, vec!["Update billing flow".to_string()]);
-        assert_eq!(suggestions.split.len(), 2);
-        assert_eq!(
-            suggestions.split[0].files,
-            vec!["src/billing.rs".to_string()]
-        );
-        assert_eq!(
-            suggestions.split[1].files,
-            vec!["src/subscription.rs".to_string()]
-        );
-        assert_eq!(
-            suggestions.note,
-            Some("AI split plan was invalid. Showing heuristic split suggestions.".to_string())
-        );
+        assert_eq!(suggestions.note, None);
     }
 
     #[test]
@@ -2689,7 +2293,7 @@ mod tests {
     }
 
     #[test]
-    fn builds_split_suggestions_for_mixed_concerns() {
+    fn omits_split_suggestions_for_mixed_concerns() {
         let suggestions = build_heuristic_commit_suggestions(&super::PromptInput {
             branch: "feature/billing".into(),
             staged_files: vec!["src/billing.rs".into(), "src/subscription.rs".into()],
@@ -2701,45 +2305,23 @@ mod tests {
             git_memory_context: Vec::new(),
         });
 
-        assert_eq!(suggestions.split.len(), 2);
-        assert!(suggestions.split[0].message.contains("billing"));
-        assert_eq!(
-            suggestions.split[0].files,
-            vec!["src/billing.rs".to_string()]
-        );
-        assert!(suggestions.split[1].message.contains("subscription"));
-        assert_eq!(
-            suggestions.split[1].files,
-            vec!["src/subscription.rs".to_string()]
-        );
+        assert_eq!(suggestions.options.len(), 3);
     }
 
     #[test]
-    fn builds_standard_split_suggestions_for_docs_and_tests() {
+    fn omits_standard_split_suggestions_for_docs_and_tests() {
         let suggestions = build_heuristic_commit_suggestions(&super::PromptInput {
             branch: "main".into(),
             staged_files: vec!["README.md".into(), "tests/ai_provider.rs".into()],
             diff_stat: "2 files changed".into(),
-            diff: "diff --git a/README.md b/README.md\n+Add split commit guidance\ndiff --git a/tests/ai_provider.rs b/tests/ai_provider.rs\n+fn covers_split_suggestions() {}\n".into(),
+            diff: "diff --git a/README.md b/README.md\n+Add commit guidance\ndiff --git a/tests/ai_provider.rs b/tests/ai_provider.rs\n+fn covers_commit_suggestions() {}\n".into(),
             commit_style: CommitStyle::Standard,
             conventional_preset: default_preset(),
             repo_memory: None,
             git_memory_context: Vec::new(),
         });
 
-        assert_eq!(
-            suggestions.split,
-            vec![
-                SplitCommitPlan {
-                    message: "Update documentation".to_string(),
-                    files: vec!["README.md".to_string()],
-                },
-                SplitCommitPlan {
-                    message: "Expand ai provider coverage".to_string(),
-                    files: vec!["tests/ai_provider.rs".to_string()],
-                },
-            ]
-        );
+        assert_eq!(suggestions.options.len(), 3);
     }
 
     #[test]
@@ -2755,7 +2337,7 @@ mod tests {
             git_memory_context: Vec::new(),
         });
 
-        assert!(suggestions.split.is_empty());
+        assert_eq!(suggestions.options.len(), 3);
     }
 
     #[test]
